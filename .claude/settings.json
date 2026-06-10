@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(tar xf *)",
+      "Bash(mkdir -p gui/ui gui/assets backend/device_server backend/camera_server backend/voice_server inc docs 2>/dev/null; echo \"dirs created\"; find . -maxdepth 1 -type d | sort)",
+      "Bash(dpkg -l)",
+      "Bash(mkdir -p libs/jsonrpc && mv libs/jsonrpc-c/* libs/jsonrpc/ && mv libs/libev libs/jsonrpc/ && rmdir libs/jsonrpc-c && echo \"done\"; ls libs/jsonrpc/; echo \"===\"; ls libs/jsonrpc/libev/ | head -10)"
+    ],
+    "additionalDirectories": [
+      "/home/zhang/Desktop/smart_screen/gui",
+      "/home/zhang/Desktop/smart_screen/libs/jsonrpc-c"
+    ]
+  }
+}

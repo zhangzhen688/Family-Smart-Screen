@@ -1,0 +1,38 @@
+# Build output
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Object files
+*.o
+*.a
+*.so
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+*.ninja
+.ninja_deps
+.ninja_log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Photo/video output
+photos/
+*.jpg
+*.avi
+
+# Reference projects (not part of the build)
+Ascend310B-sdk/
+refs/
+
+# XiaoZhi config (contains device UUID)
+/etc/xiaozhi.cfg
