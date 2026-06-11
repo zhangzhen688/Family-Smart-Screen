@@ -148,11 +148,21 @@ static void yuyv_to_bgra(const uint8_t *yuyv, uint8_t *bgra,
 struct jpeg_err_mgr {
     struct jpeg_error_mgr pub;
     jmp_buf jb;
+    int     fatal;            /* set to 1 when error_exit fires       */
+    int     rows_decoded;     /* how many rows were actually processed */
 };
+
+/* Suppress libjpeg's stderr noise — corrupt frames are expected
+ * with this camera.  We detect failures via the fatal flag instead. */
+static void silent_emit_message(j_common_ptr cinfo, int level)
+{
+    (void)cinfo; (void)level;  /* discard all diagnostic messages */
+}
 
 static void jpeg_error_exit(j_common_ptr cinfo)
 {
     struct jpeg_err_mgr *err = (struct jpeg_err_mgr *)cinfo->err;
+    err->fatal = 1;
     longjmp(err->jb, 1);
 }
 
@@ -188,10 +198,14 @@ static int jpeg_to_rgb(const uint8_t *jpeg_data, size_t jpeg_size,
     struct jpeg_err_mgr jerr;
 
     memset(&cinfo, 0, sizeof(cinfo));
+    memset(&jerr, 0, sizeof(jerr));
     cinfo.err = jpeg_std_error(&jerr.pub);
-    jerr.pub.error_exit = jpeg_error_exit;
+    jerr.pub.error_exit      = jpeg_error_exit;
+    jerr.pub.emit_message    = silent_emit_message;  /* no stderr spam */
+    jerr.fatal                = 0;
 
     if (setjmp(jerr.jb)) {
+        /* fatal error — partial decode, abandon */
         jpeg_destroy_decompress(&cinfo);
         return -1;
     }
@@ -208,47 +222,37 @@ static int jpeg_to_rgb(const uint8_t *jpeg_data, size_t jpeg_size,
     *out_w = dw;
     *out_h = dh;
 
-    /* If decoded image doesn't fit in buffer, clamp and clear */
-    int render_w = (dw < buf_w) ? dw : buf_w;
-    int render_h = (dh < buf_h) ? dh : buf_h;
-
-    if (dw != buf_w || dh != buf_h) {
-        LOG_INFO("JPEG %dx%d → buffer %dx%d (mismatch)", dw, dh, buf_w, buf_h);
+    /* If decoded image dimensions don't fit our buffer, fail early —
+     * the caller should reallocate and retry. */
+    if (dw > buf_w || dh > buf_h) {
+        LOG_ERROR("JPEG %dx%d exceeds buffer %dx%d", dw, dh, buf_w, buf_h);
+        jpeg_destroy_decompress(&cinfo);
+        return -1;
     }
 
-    /* Clear entire buffer to avoid stale-data artefacts */
+    /* Clear the buffer so incomplete rows show as black rather than
+     * stale data from a previous successful decode. */
     memset(rgb_buf, 0, (size_t)buf_h * (size_t)stride);
 
     /* Decode row-by-row */
     JSAMPROW row_ptr[1];
-    JDIMENSION row;
-    for (row = 0; row < (JDIMENSION)render_h; row++) {
+    JDIMENSION row = 0;
+    for (; row < cinfo.output_height; row++) {
         row_ptr[0] = rgb_buf + row * stride;
         jpeg_read_scanlines(&cinfo, row_ptr, 1);
     }
-    /* If image is wider than buffer, skip the extra columns in each row.
-     * libjpeg doesn't have per-row column skipping, but since we only decode
-     * render_h rows into a buf_w-wide buffer, the excess columns per row
-     * are silently discarded by the decoder (they go past our row pointer).
-     * Actually the row pointer only covers buf_w * 4 bytes — the decoder
-     * writes exactly cinfo.output_width pixels per row which may overflow.
-     * We handle this by clamping render_w above and hoping the decoder
-     * doesn't write more than render_w pixels...
-     *
-     * Safer approach: if dw > buf_w, we need to decode full rows into a temp
-     * buffer then copy only the left buf_w pixels.  For now, assume the
-     * camera produces frames matching our buffer size (640x480). */
+    jerr.rows_decoded = (int)row;
 
-    /* Drain any remaining rows we skipped */
-    uint8_t dummy[8192];
-    while (row < cinfo.output_height) {
-        row_ptr[0] = dummy;
-        jpeg_read_scanlines(&cinfo, row_ptr, 1);
-        row++;
+    /* jpeg_finish_decompress returns FALSE if the file is corrupt
+     * (truncated / premature end).  Reject such frames — they
+     * produce visual artefacts (bottom half missing / flicker). */
+    int complete = jpeg_finish_decompress(&cinfo);
+    jpeg_destroy_decompress(&cinfo);
+
+    if (!complete || jerr.fatal) {
+        return -1;   /* corrupt frame — keep displaying previous valid one */
     }
 
-    jpeg_finish_decompress(&cinfo);
-    jpeg_destroy_decompress(&cinfo);
     return 0;
 }
 
