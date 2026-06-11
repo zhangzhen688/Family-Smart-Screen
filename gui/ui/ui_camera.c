@@ -1,14 +1,9 @@
 /**
  * @file ui_camera.c — Camera page with live preview via shared memory.
  *
- * Control flow (JSON-RPC over TCP):
- *   camera_start / camera_stop / take_photo / start_recording / ...
- *
- * Data flow (POSIX shared memory):
- *   camera_server producer → ring buffer → camera_reader → JPEG validate → decode → LVGL
- *
- * Image display uses lv_image_dsc_t (the standard LVGL v9 API for in-memory
- * raw images) with ping-pong double buffering to prevent tearing.
+ * Control flow (JSON-RPC over TCP):   camera_start / camera_stop / …
+ * Data flow  (POSIX shared memory):   ring buffer → JPEG decode →
+ *   bilinear scale to exact preview size → LVGL display (no LVGL scaling).
  */
 #include "lvgl.h"
 #include "common.h"
@@ -32,35 +27,35 @@
 /* ── Static state ─────────────────────────────────────────────────────── */
 
 static lv_obj_t  *screen_camera  = NULL, *label_status = NULL;
-static lv_obj_t  *preview_img    = NULL;     /* LVGL image widget            */
-static lv_obj_t  *placeholder    = NULL;     /* "Camera Preview" placeholder */
+static lv_obj_t  *preview_img    = NULL;
+static lv_obj_t  *placeholder    = NULL;
+static lv_obj_t  *preview_ctnr   = NULL;     /* preview container (for size) */
 
 /*
- * Double-buffer (ping-pong) for tear-free display.
- *
- * While LVGL renders from image descriptor A, the next JPEG frame decodes
- * into buffer B.  The roles swap each frame.  This guarantees LVGL never
- * reads a buffer that is being written.
+ * Ping-pong display buffers sized to the preview container (e.g. 768×340).
+ * JPEG is first decoded at camera resolution (640×480) into g_decode_buf,
+ * then bilinear-scaled to one of these display buffers.  LVGL renders the
+ * other.  This eliminates all LVGL-internal scaling — we always feed LVGL
+ * a buffer that exactly matches the widget size.
  */
 static struct {
-    lv_image_dsc_t  dsc;          /* LVGL image descriptor (header + data ptr) */
-    uint8_t        *rgb;          /* malloc'd BGRA pixel buffer                */
-    int             w, h;         /* current dimensions of this buffer         */
-    int             stride;       /* bytes per row                             */
+    lv_image_dsc_t  dsc;
+    uint8_t        *rgb;
+    int             w, h, stride;
 } g_buf[2];
-static int  g_buf_idx     = 0;        /* which buffer is currently displayed  */
+static int       g_buf_idx    = 0;
+static uint8_t  *g_decode_buf = NULL;  /* temp: camera-res decode (640×480)   */
+static int       g_cam_w = 640, g_cam_h = 480;
+static int       g_view_w = 0, g_view_h = 0;  /* preview container pixel size */
 
-static lv_timer_t *preview_timer = NULL;     /* ~30 fps refresh timer       */
-static bool        g_cam_running = false;
-static bool        g_preview_active = false;
+static lv_timer_t *preview_timer = NULL;
+static bool        g_cam_running = false, g_preview_active = false;
 static bool        g_recording   = false;
 static int         g_cam_fd      = -1;
-static int         g_cam_width   = 0;
-static int         g_cam_height  = 0;
 
 extern lv_obj_t *g_main_screen;
 
-/* ── Buffer management helpers ────────────────────────────────────────── */
+/* ── Buffer helpers ───────────────────────────────────────────────────── */
 
 static void free_buf(int i)
 {
@@ -72,23 +67,19 @@ static void free_buf(int i)
 static int alloc_buf(int i, int w, int h)
 {
     free_buf(i);
-
-    int stride = w * 4;  /* ARGB8888 = 4 bytes per pixel */
-    size_t data_size = (size_t)stride * (size_t)h;
-    uint8_t *rgb = malloc(data_size);
+    int stride = w * 4;
+    size_t sz  = (size_t)stride * (size_t)h;
+    uint8_t *rgb = malloc(sz);
     if (!rgb) return -1;
+    memset(rgb, 0, sz);
 
-    memset(rgb, 0, data_size);  /* black frame */
-
-    /* Populate LVGL image descriptor — the standard API for raw in-memory images */
-    g_buf[i].dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
-    g_buf[i].dsc.header.cf    = LV_COLOR_FORMAT_ARGB8888;
-    g_buf[i].dsc.header.w     = (uint32_t)w;
-    g_buf[i].dsc.header.h     = (uint32_t)h;
-    g_buf[i].dsc.header.stride = (uint32_t)stride;
-    g_buf[i].dsc.data_size    = (uint32_t)data_size;
-    g_buf[i].dsc.data         = rgb;
-
+    g_buf[i].dsc.header.magic  = LV_IMAGE_HEADER_MAGIC;
+    g_buf[i].dsc.header.cf     = LV_COLOR_FORMAT_ARGB8888;
+    g_buf[i].dsc.header.w      = (uint16_t)w;
+    g_buf[i].dsc.header.h      = (uint16_t)h;
+    g_buf[i].dsc.header.stride = (uint16_t)stride;
+    g_buf[i].dsc.data_size     = (uint32_t)sz;
+    g_buf[i].dsc.data          = rgb;
     g_buf[i].rgb    = rgb;
     g_buf[i].w      = w;
     g_buf[i].h      = h;
@@ -96,68 +87,88 @@ static int alloc_buf(int i, int w, int h)
     return 0;
 }
 
-/* ── Pixel format dispatch ────────────────────────────────────────────── */
+/* ── YUYV → BGRA converter ───────────────────────────────────────────── */
 
-static uint32_t g_pixel_format = 0;   /* V4L2_PIX_FMT_YUYV or MJPEG */
-
-/*
- * Convert YUYV (YUY2) → BGRA (ARGB8888).
- *
- * YUYV packs 2 pixels into 4 bytes: [Y0][U][Y1][V]
- *   Pixel 0: (Y0, U, V)   Pixel 1: (Y1, U, V)
- *
- * BT.601 full-range (0–255) with 16-bit fixed-point coefficients:
- *   Cb = U - 128,  Cr = V - 128
- *   R = Y + ((359 * Cr) >> 8)
- *   G = Y - (( 88 * Cb + 183 * Cr) >> 8)
- *   B = Y + ((454 * Cb) >> 8)
- */
 static inline int clamp8(int v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
 
 static void yuyv_to_bgra(const uint8_t *yuyv, uint8_t *bgra,
                          int w, int h, int stride)
 {
     for (int y = 0; y < h; y++) {
-        const uint8_t *src = yuyv + y * w * 2;    /* YUYV row: w*2 bytes */
-        uint8_t       *dst = bgra + y * stride;   /* BGRA row: w*4 bytes  */
-
+        const uint8_t *src = yuyv + y * w * 2;
+        uint8_t       *dst = bgra + y * stride;
         for (int x = 0; x < w; x += 2) {
-            int Y0 = src[0], U  = src[1] - 128;
-            int Y1 = src[2], V  = src[3] - 128;
-
-            /* Pixel 0 */
-            dst[0] = (uint8_t)clamp8(Y0 + ((454 * U) >> 8));          /* B */
-            dst[1] = (uint8_t)clamp8(Y0 - (( 88 * U + 183 * V) >> 8)); /* G */
-            dst[2] = (uint8_t)clamp8(Y0 + ((359 * V) >> 8));          /* R */
-            dst[3] = 255;                                              /* A */
-
-            /* Pixel 1 */
+            int Y0 = src[0], U = src[1] - 128, Y1 = src[2], V = src[3] - 128;
+            dst[0] = (uint8_t)clamp8(Y0 + ((454 * U) >> 8));
+            dst[1] = (uint8_t)clamp8(Y0 - (( 88 * U + 183 * V) >> 8));
+            dst[2] = (uint8_t)clamp8(Y0 + ((359 * V) >> 8));
+            dst[3] = 255;
             dst[4] = (uint8_t)clamp8(Y1 + ((454 * U) >> 8));
             dst[5] = (uint8_t)clamp8(Y1 - (( 88 * U + 183 * V) >> 8));
             dst[6] = (uint8_t)clamp8(Y1 + ((359 * V) >> 8));
             dst[7] = 255;
-
-            src += 4;
-            dst += 8;
+            src += 4; dst += 8;
         }
     }
 }
 
-/* ── JPEG → BGRA (ARGB8888) decoder ───────────────────────────────────── */
+/* ── Bilinear scale BGRA → BGRA ──────────────────────────────────────── */
+
+static void scale_bilinear(const uint8_t *src, int sw, int sh, int sstride,
+                           uint8_t *dst, int dw, int dh, int dstride)
+{
+    /*
+     * For each destination pixel (dx,dy), map back to source coordinates
+     * (sx,sy) using fixed-point arithmetic, then blend the 4 nearest
+     * source pixels.
+     */
+    for (int dy = 0; dy < dh; dy++) {
+        /* source y with 16-bit fractional part — use 64-bit to avoid overflow */
+        int sy_fp = (int)(((int64_t)dy * sh * 65536) / dh);
+        int sy    = sy_fp >> 16;            /* integer part */
+        int fy    = sy_fp & 0xFFFF;         /* fractional [0,65535] */
+        int sy2   = (sy + 1 < sh) ? sy + 1 : sy;
+
+        uint8_t *drow = dst + dy * dstride;
+
+        for (int dx = 0; dx < dw; dx++) {
+            int sx_fp = (int)(((int64_t)dx * sw * 65536) / dw);
+            int sx    = sx_fp >> 16;
+            int fx    = sx_fp & 0xFFFF;
+            int sx2   = (sx + 1 < sw) ? sx + 1 : sx;
+
+            /* 4 source pixels */
+            const uint8_t *p00 = src + sy  * sstride + sx  * 4;
+            const uint8_t *p01 = src + sy  * sstride + sx2 * 4;
+            const uint8_t *p10 = src + sy2 * sstride + sx  * 4;
+            const uint8_t *p11 = src + sy2 * sstride + sx2 * 4;
+
+            uint8_t *out = drow + dx * 4;
+
+            /* Blend each channel — 16-bit fixed-point weights */
+            for (int c = 0; c < 4; c++) {
+                int v00 = p00[c], v01 = p01[c], v10 = p10[c], v11 = p11[c];
+                /* top row blend */
+                int top = ((v00 * (65536 - fx)) + (v01 * fx)) >> 16;
+                /* bottom row blend */
+                int bot = ((v10 * (65536 - fx)) + (v11 * fx)) >> 16;
+                /* vertical blend */
+                out[c] = (uint8_t)(((top * (65536 - fy)) + (bot * fy)) >> 16);
+            }
+        }
+    }
+}
+
+/* ── JPEG decoder (silent, validates completeness) ────────────────────── */
 
 struct jpeg_err_mgr {
     struct jpeg_error_mgr pub;
     jmp_buf jb;
-    int     fatal;            /* set to 1 when error_exit fires       */
-    int     rows_decoded;     /* how many rows were actually processed */
+    int     fatal;
 };
 
-/* Suppress libjpeg's stderr noise — corrupt frames are expected
- * with this camera.  We detect failures via the fatal flag instead. */
 static void silent_emit_message(j_common_ptr cinfo, int level)
-{
-    (void)cinfo; (void)level;  /* discard all diagnostic messages */
-}
+{ (void)cinfo; (void)level; }
 
 static void jpeg_error_exit(j_common_ptr cinfo)
 {
@@ -166,33 +177,14 @@ static void jpeg_error_exit(j_common_ptr cinfo)
     longjmp(err->jb, 1);
 }
 
-/**
- * Quick check: is this buffer likely a JPEG? (SOI marker 0xFF 0xD8)
- */
 static inline int looks_like_jpeg(const uint8_t *data, size_t size)
-{
-    return (size >= 2 && data[0] == 0xFF && data[1] == 0xD8);
-}
+{ return (size >= 2 && data[0] == 0xFF && data[1] == 0xD8); }
 
-/**
- * Decode JPEG into a BGRA pixel buffer.
- *
- * On little-endian, JCS_EXT_BGRA produces [B,G,R,A] — exactly
- * the memory layout of LV_COLOR_FORMAT_ARGB8888.
- *
- * @param rgb_buf   destination BGRA buffer
- * @param stride    bytes per row in rgb_buf
- * @param buf_w     width of rgb_buf in pixels
- * @param buf_h     height of rgb_buf in pixels
- * @param out_w/h   actual decoded image dimensions
- * @return 0 on success, -1 on error.
- */
 static int jpeg_to_rgb(const uint8_t *jpeg_data, size_t jpeg_size,
                        uint8_t *rgb_buf, int stride, int buf_w, int buf_h,
                        int *out_w, int *out_h)
 {
-    if (!looks_like_jpeg(jpeg_data, jpeg_size))
-        return -1;
+    if (!looks_like_jpeg(jpeg_data, jpeg_size)) return -1;
 
     struct jpeg_decompress_struct cinfo;
     struct jpeg_err_mgr jerr;
@@ -200,12 +192,11 @@ static int jpeg_to_rgb(const uint8_t *jpeg_data, size_t jpeg_size,
     memset(&cinfo, 0, sizeof(cinfo));
     memset(&jerr, 0, sizeof(jerr));
     cinfo.err = jpeg_std_error(&jerr.pub);
-    jerr.pub.error_exit      = jpeg_error_exit;
-    jerr.pub.emit_message    = silent_emit_message;  /* no stderr spam */
-    jerr.fatal                = 0;
+    jerr.pub.error_exit   = jpeg_error_exit;
+    jerr.pub.emit_message = silent_emit_message;
+    jerr.fatal             = 0;
 
     if (setjmp(jerr.jb)) {
-        /* fatal error — partial decode, abandon */
         jpeg_destroy_decompress(&cinfo);
         return -1;
     }
@@ -213,128 +204,98 @@ static int jpeg_to_rgb(const uint8_t *jpeg_data, size_t jpeg_size,
     jpeg_create_decompress(&cinfo);
     jpeg_mem_src(&cinfo, jpeg_data, jpeg_size);
     jpeg_read_header(&cinfo, TRUE);
-
     cinfo.out_color_space = JCS_EXT_BGRA;
     jpeg_start_decompress(&cinfo);
 
     int dw = (int)cinfo.output_width;
     int dh = (int)cinfo.output_height;
-    *out_w = dw;
-    *out_h = dh;
+    *out_w = dw; *out_h = dh;
 
-    /* If decoded image dimensions don't fit our buffer, fail early —
-     * the caller should reallocate and retry. */
     if (dw > buf_w || dh > buf_h) {
-        LOG_ERROR("JPEG %dx%d exceeds buffer %dx%d", dw, dh, buf_w, buf_h);
         jpeg_destroy_decompress(&cinfo);
         return -1;
     }
 
-    /* Clear the buffer so incomplete rows show as black rather than
-     * stale data from a previous successful decode. */
     memset(rgb_buf, 0, (size_t)buf_h * (size_t)stride);
 
-    /* Decode row-by-row */
     JSAMPROW row_ptr[1];
-    JDIMENSION row = 0;
-    for (; row < cinfo.output_height; row++) {
+    JDIMENSION row;
+    for (row = 0; row < cinfo.output_height; row++) {
         row_ptr[0] = rgb_buf + row * stride;
         jpeg_read_scanlines(&cinfo, row_ptr, 1);
     }
-    jerr.rows_decoded = (int)row;
 
-    /* jpeg_finish_decompress returns FALSE if the file is corrupt
-     * (truncated / premature end).  Reject such frames — they
-     * produce visual artefacts (bottom half missing / flicker). */
     int complete = jpeg_finish_decompress(&cinfo);
     jpeg_destroy_decompress(&cinfo);
 
-    if (!complete || jerr.fatal) {
-        return -1;   /* corrupt frame — keep displaying previous valid one */
-    }
-
+    if (!complete || jerr.fatal) return -1;
     return 0;
 }
 
-/* ── Preview timer callback (~30 fps) ─────────────────────────────────── */
+/* ── Pixel format dispatch & frame display ────────────────────────────── */
 
-/* V4L2 pixel format fourcc codes (avoid dragging in linux/videodev2.h) */
-#define FMT_YUYV  0x56595559   /* 'YUYV' */
-#define FMT_MJPEG 0x47504A4D   /* 'MJPG' */
+#define FMT_YUYV  0x56595559
+#define FMT_MJPEG 0x47504A4D
+static uint32_t g_pixel_format = 0;
 
 static int try_decode_and_display(void)
 {
     uint8_t *frame_data;
     size_t   frame_size;
 
-    /* Non-blocking read from ring buffer */
     if (camera_reader_read_frame(&frame_data, &frame_size) != 0)
         return -1;
 
-    /* Determine pixel format on first frame */
     if (g_pixel_format == 0)
         g_pixel_format = camera_reader_get_pixel_format();
 
     int next = g_buf_idx ^ 1;
-    int dw = g_buf[next].w, dh = g_buf[next].h;
 
     if (g_pixel_format == FMT_YUYV) {
-        /* YUYV: every frame is valid, fixed size = width * height * 2 */
-        size_t expected = (size_t)g_cam_width * (size_t)g_cam_height * 2;
-        if (frame_size < expected) {
-            LOG_ERROR("YUYV frame too small: %zu < %zu", frame_size, expected);
-            return -1;
-        }
+        /* YUYV path: convert directly, then scale to view size */
+        size_t expected = (size_t)g_cam_w * (size_t)g_cam_h * 2;
+        if (frame_size < expected) return -1;
 
-        /* In case the camera negotiated a different size */
-        if (dw != g_cam_width || dh != g_cam_height) {
-            for (int i = 0; i < 2; i++) {
-                if (alloc_buf(i, g_cam_width, g_cam_height) < 0) return -1;
-            }
-            next = g_buf_idx ^ 1;
-            dw = g_cam_width; dh = g_cam_height;
-        }
-
-        yuyv_to_bgra(frame_data, g_buf[next].rgb, dw, dh, g_buf[next].stride);
+        yuyv_to_bgra(frame_data, g_decode_buf, g_cam_w, g_cam_h, g_cam_w * 4);
 
     } else {
-        /* MJPEG: validate and decode */
+        /* MJPEG path: skip garbage frames, decode, validate completeness */
         for (int attempt = 0; attempt < 3; attempt++) {
             if (!looks_like_jpeg(frame_data, frame_size)) {
-                /* Drain this garbage frame and try the next */
                 if (camera_reader_read_frame(&frame_data, &frame_size) != 0)
                     return -1;
                 continue;
             }
-
+            int dw, dh;
             if (jpeg_to_rgb(frame_data, frame_size,
-                            g_buf[next].rgb, g_buf[next].stride,
-                            g_buf[next].w, g_buf[next].h,
-                            &dw, &dh) == 0)
+                            g_decode_buf, g_cam_w * 4,
+                            g_cam_w, g_cam_h, &dw, &dh) == 0) {
+                if (dw != g_cam_w || dh != g_cam_h) {
+                    /* Camera changed resolution — realloc decode buf */
+                    g_cam_w = dw; g_cam_h = dh;
+                    free(g_decode_buf);
+                    g_decode_buf = malloc((size_t)dw * (size_t)dh * 4);
+                    if (!g_decode_buf) return -1;
+                    /* Re-decode into new buffer */
+                    if (jpeg_to_rgb(frame_data, frame_size,
+                                    g_decode_buf, dw * 4,
+                                    dw, dh, &dw, &dh) != 0)
+                        return -1;
+                }
                 break;   /* success */
-
-            /* Decode failed — try next frame */
-            if (camera_reader_read_frame(&frame_data, &frame_size) != 0)
-                return -1;
-        }
-        if (dw <= 0) return -1;   /* all attempts failed */
-
-        /* Resize if dimensions changed */
-        if (dw != g_buf[next].w || dh != g_buf[next].h) {
-            LOG_INFO("Resizing: %dx%d → %dx%d", g_buf[next].w, g_buf[next].h, dw, dh);
-            for (int i = 0; i < 2; i++) {
-                if (alloc_buf(i, dw, dh) < 0) return -1;
             }
-            next = g_buf_idx ^ 1;
-            if (jpeg_to_rgb(frame_data, frame_size,
-                            g_buf[next].rgb, g_buf[next].stride,
-                            g_buf[next].w, g_buf[next].h,
-                            &dw, &dh) != 0)
+            /* decode failed — try next frame */
+            if (camera_reader_read_frame(&frame_data, &frame_size) != 0)
                 return -1;
         }
     }
 
-    /* Swap: new frame becomes active */
+    /* Bilinear scale from camera resolution → preview container size */
+    scale_bilinear(g_decode_buf, g_cam_w, g_cam_h, g_cam_w * 4,
+                   g_buf[next].rgb, g_buf[next].w, g_buf[next].h,
+                   g_buf[next].stride);
+
+    /* Swap and push to LVGL */
     g_buf_idx = next;
     lv_image_set_src(preview_img, &g_buf[next].dsc);
     return 0;
@@ -345,18 +306,16 @@ static void preview_timer_cb(lv_timer_t *t)
     (void)t;
     if (!g_preview_active || !preview_img) return;
     if (!g_buf[0].rgb || !g_buf[1].rgb) return;
+    if (!g_decode_buf) return;
 
     try_decode_and_display();
 }
 
-/* ── Cleanup helpers ──────────────────────────────────────────────────── */
+/* ── Preview start / stop ─────────────────────────────────────────────── */
 
 static void preview_stop(void)
 {
-    if (preview_timer) {
-        lv_timer_del(preview_timer);
-        preview_timer = NULL;
-    }
+    if (preview_timer) { lv_timer_del(preview_timer); preview_timer = NULL; }
     g_preview_active = false;
 
     camera_reader_deinit();
@@ -364,53 +323,63 @@ static void preview_stop(void)
     for (int i = 0; i < 2; i++) free_buf(i);
     g_buf_idx = 0;
 
-    /* Tell the server to stop streaming */
-    if (g_cam_fd > 0) {
-        rpc_call_void(g_cam_fd, RPC_METHOD_CAMERA_STOP_PREVIEW);
-    }
+    free(g_decode_buf); g_decode_buf = NULL;
 
-    /* Clear the image and hide it */
+    if (g_cam_fd > 0)
+        rpc_call_void(g_cam_fd, RPC_METHOD_CAMERA_STOP_PREVIEW);
+
     if (preview_img) {
         lv_image_set_src(preview_img, NULL);
         lv_obj_add_flag(preview_img, LV_OBJ_FLAG_HIDDEN);
     }
-
-    /* Show the placeholder text again */
-    if (placeholder) {
+    if (placeholder)
         lv_obj_clear_flag(placeholder, LV_OBJ_FLAG_HIDDEN);
-    }
 }
 
 static int preview_start(void)
 {
     if (camera_reader_init() < 0) return -1;
 
-    camera_reader_get_dimensions(&g_cam_width, &g_cam_height);
-    if (g_cam_width <= 0) g_cam_width = 640;
-    if (g_cam_height <= 0) g_cam_height = 480;
+    camera_reader_get_dimensions(&g_cam_w, &g_cam_h);
+    if (g_cam_w <= 0) g_cam_w = 640;
+    if (g_cam_h <= 0) g_cam_h = 480;
 
-    LOG_INFO("Preview: allocating %dx%d ARGB8888 ping-pong buffers", g_cam_width, g_cam_height);
+    /* Get preview container content size in actual pixels */
+    if (preview_ctnr) {
+        g_view_w = lv_obj_get_content_width(preview_ctnr);
+        g_view_h = lv_obj_get_content_height(preview_ctnr);
+    }
+    if (g_view_w <= 0) g_view_w = 768;
+    if (g_view_h <= 0) g_view_h = 340;
 
-    /* Allocate two identical buffers for ping-pong double buffering */
+    LOG_INFO("Preview: camera %dx%d → view %dx%d", g_cam_w, g_cam_h, g_view_w, g_view_h);
+
+    /* Temp buffer for JPEG decode at camera resolution */
+    g_decode_buf = malloc((size_t)g_cam_w * (size_t)g_cam_h * 4);
+    if (!g_decode_buf) { camera_reader_deinit(); return -1; }
+
+    /* Two display buffers at exact preview container size */
     for (int i = 0; i < 2; i++) {
-        if (alloc_buf(i, g_cam_width, g_cam_height) < 0) {
-            LOG_ERROR("Failed to allocate buffer %d (%dx%d)", i, g_cam_width, g_cam_height);
+        if (alloc_buf(i, g_view_w, g_view_h) < 0) {
             for (int j = 0; j < i; j++) free_buf(j);
+            free(g_decode_buf); g_decode_buf = NULL;
             camera_reader_deinit();
             return -1;
         }
     }
     g_buf_idx = 0;
 
-    /* Hide placeholder, show image widget */
     if (placeholder) lv_obj_add_flag(placeholder, LV_OBJ_FLAG_HIDDEN);
-    if (preview_img) lv_obj_clear_flag(preview_img, LV_OBJ_FLAG_HIDDEN);
+    if (preview_img) {
+        /* Match image widget size to display buffer size exactly */
+        lv_obj_set_size(preview_img, g_view_w, g_view_h);
+        lv_obj_clear_flag(preview_img, LV_OBJ_FLAG_HIDDEN);
+    }
 
-    /* Start ~30 fps refresh timer */
     preview_timer = lv_timer_create(preview_timer_cb, 33, NULL);
     if (!preview_timer) {
-        LOG_ERROR("Failed to create preview timer");
         for (int i = 0; i < 2; i++) free_buf(i);
+        free(g_decode_buf); g_decode_buf = NULL;
         camera_reader_deinit();
         return -1;
     }
@@ -425,14 +394,11 @@ static void back_cb(lv_event_t *e)
 {
     (void)e;
     preview_stop();
-
     if (g_cam_running && g_cam_fd > 0) {
         rpc_call_void(g_cam_fd, RPC_METHOD_CAMERA_STOP);
         rpc_disconnect(g_cam_fd);
-        g_cam_fd = -1;
-        g_cam_running = false;
+        g_cam_fd = -1; g_cam_running = false;
     }
-
     if (g_main_screen) lv_scr_load(g_main_screen);
 }
 
@@ -441,23 +407,19 @@ static void open_cb(lv_event_t *e)
     lv_obj_t *btn = lv_event_get_target(e);
     lv_obj_t *lbl = lv_obj_get_child(btn, 0);
 
-    /* ── Toggle OFF ───────────────────────────────────────────────── */
     if (g_cam_running) {
         preview_stop();
-
         if (g_cam_fd > 0) {
             rpc_call_void(g_cam_fd, RPC_METHOD_CAMERA_STOP);
             rpc_disconnect(g_cam_fd);
             g_cam_fd = -1;
         }
         g_cam_running = false;
-
         if (lbl) lv_label_set_text(lbl, "Open Camera");
         if (label_status) lv_label_set_text(label_status, "Camera closed");
         return;
     }
 
-    /* ── Toggle ON ────────────────────────────────────────────────── */
     g_cam_fd = rpc_connect(CAMERA_SERVER_PORT);
     if (g_cam_fd < 0) {
         if (label_status) lv_label_set_text(label_status, "Cannot connect to camera");
@@ -466,12 +428,8 @@ static void open_cb(lv_event_t *e)
 
     cJSON *r = rpc_call_void(g_cam_fd, RPC_METHOD_CAMERA_START);
     if (!r || !cJSON_IsTrue(cJSON_GetObjectItem(r, "ok"))) {
-        /* Show the actual error from the server */
         const char *err = "Camera init failed";
-        if (r) {
-            cJSON *e = cJSON_GetObjectItem(r, "error");
-            if (e && e->valuestring) err = e->valuestring;
-        }
+        if (r) { cJSON *e = cJSON_GetObjectItem(r, "error"); if (e && e->valuestring) err = e->valuestring; }
         if (label_status) lv_label_set_text(label_status, err);
         if (r) cJSON_Delete(r);
         rpc_disconnect(g_cam_fd); g_cam_fd = -1;
@@ -485,18 +443,16 @@ static void open_cb(lv_event_t *e)
         if (label_status) lv_label_set_text(label_status, "Preview stream failed");
         if (r) cJSON_Delete(r);
         rpc_call_void(g_cam_fd, RPC_METHOD_CAMERA_STOP);
-        rpc_disconnect(g_cam_fd); g_cam_fd = -1;
-        g_cam_running = false;
+        rpc_disconnect(g_cam_fd); g_cam_fd = -1; g_cam_running = false;
         return;
     }
     cJSON_Delete(r);
 
     if (preview_start() < 0) {
-        if (label_status) lv_label_set_text(label_status, "Shm reader init failed");
+        if (label_status) lv_label_set_text(label_status, "Preview init failed");
         rpc_call_void(g_cam_fd, RPC_METHOD_CAMERA_STOP_PREVIEW);
         rpc_call_void(g_cam_fd, RPC_METHOD_CAMERA_STOP);
-        rpc_disconnect(g_cam_fd); g_cam_fd = -1;
-        g_cam_running = false;
+        rpc_disconnect(g_cam_fd); g_cam_fd = -1; g_cam_running = false;
         return;
     }
 
@@ -511,17 +467,11 @@ static void photo_cb(lv_event_t *e)
         if (label_status) lv_label_set_text(label_status, "Open camera first");
         return;
     }
-
-    char fn[64];
-    snprintf(fn, sizeof(fn), "photo_%ld.jpg", (long)time(NULL));
-
-    cJSON *p = cJSON_CreateArray();
-    cJSON_AddItemToArray(p, cJSON_CreateString(fn));
+    char fn[64]; snprintf(fn, sizeof(fn), "photo_%ld.jpg", (long)time(NULL));
+    cJSON *p = cJSON_CreateArray(); cJSON_AddItemToArray(p, cJSON_CreateString(fn));
     cJSON *r = rpc_call(g_cam_fd, RPC_METHOD_CAMERA_TAKE_PHOTO, p);
-
     if (r && cJSON_IsTrue(cJSON_GetObjectItem(r, "ok"))) {
-        char b[128];
-        snprintf(b, sizeof(b), "Saved: %s", fn);
+        char b[128]; snprintf(b, sizeof(b), "Saved: %s", fn);
         if (label_status) lv_label_set_text(label_status, b);
     } else {
         if (label_status) lv_label_set_text(label_status, "Photo failed");
@@ -533,26 +483,16 @@ static void rec_cb(lv_event_t *e)
 {
     (void)e;
     if (!g_cam_running || g_cam_fd < 0) return;
-
     if (!g_recording) {
-        char fn[64];
-        snprintf(fn, sizeof(fn), "video_%ld.avi", (long)time(NULL));
-
-        cJSON *p = cJSON_CreateArray();
-        cJSON_AddItemToArray(p, cJSON_CreateString(fn));
+        char fn[64]; snprintf(fn, sizeof(fn), "video_%ld.avi", (long)time(NULL));
+        cJSON *p = cJSON_CreateArray(); cJSON_AddItemToArray(p, cJSON_CreateString(fn));
         cJSON *r = rpc_call(g_cam_fd, RPC_METHOD_CAMERA_START_RECORDING, p);
-        if (r) {
-            cJSON_Delete(r);
-            g_recording = true;
-            if (label_status) lv_label_set_text(label_status, "● RECORDING");
-        }
+        if (r) { cJSON_Delete(r); g_recording = true;
+            if (label_status) lv_label_set_text(label_status, "● RECORDING"); }
     } else {
         cJSON *r = rpc_call_void(g_cam_fd, RPC_METHOD_CAMERA_STOP_RECORDING);
-        if (r) {
-            cJSON_Delete(r);
-            g_recording = false;
-            if (label_status) lv_label_set_text(label_status, "Stopped");
-        }
+        if (r) { cJSON_Delete(r); g_recording = false;
+            if (label_status) lv_label_set_text(label_status, "Stopped"); }
     }
 }
 
@@ -572,51 +512,40 @@ void ui_camera_page_create(void)
     lv_obj_align(title, LV_ALIGN_TOP_LEFT, 0, 8);
 
     lv_obj_t *bb = lv_btn_create(screen_camera);
-    lv_obj_set_size(bb, 80, 32);
-    lv_obj_align(bb, LV_ALIGN_TOP_RIGHT, 0, 8);
+    lv_obj_set_size(bb, 80, 32); lv_obj_align(bb, LV_ALIGN_TOP_RIGHT, 0, 8);
     lv_obj_set_style_bg_color(bb, lv_color_hex(CARD_COLOR), 0);
     lv_obj_set_style_radius(bb, 8, 0);
     lv_obj_add_event_cb(bb, back_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *bl = lv_label_create(bb);
-    lv_label_set_text(bl, "< Back");
-    lv_obj_center(bl);
+    lv_obj_t *bl = lv_label_create(bb); lv_label_set_text(bl, "< Back"); lv_obj_center(bl);
 
     /* ── Preview container ────────────────────────────────────────── */
-    lv_obj_t *preview = lv_obj_create(screen_camera);
-    lv_obj_set_size(preview, LV_PCT(100), 340);
-    lv_obj_set_style_bg_color(preview, lv_color_black(), 0);
-    lv_obj_set_style_radius(preview, 14, 0);
-    lv_obj_set_style_border_width(preview, 2, 0);
-    lv_obj_set_style_border_color(preview, lv_color_hex(CARD_COLOR), 0);
-    lv_obj_set_style_bg_opa(preview, LV_OPA_COVER, 0);
-    lv_obj_set_style_pad_all(preview, 0, 0);
-    lv_obj_align(preview, LV_ALIGN_TOP_MID, 0, 52);
-    lv_obj_set_style_clip_corner(preview, true, 0);
+    preview_ctnr = lv_obj_create(screen_camera);
+    lv_obj_set_size(preview_ctnr, LV_PCT(100), 340);
+    lv_obj_set_style_bg_color(preview_ctnr, lv_color_black(), 0);
+    lv_obj_set_style_radius(preview_ctnr, 14, 0);
+    lv_obj_set_style_border_width(preview_ctnr, 2, 0);
+    lv_obj_set_style_border_color(preview_ctnr, lv_color_hex(CARD_COLOR), 0);
+    lv_obj_set_style_bg_opa(preview_ctnr, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(preview_ctnr, 0, 0);
+    lv_obj_align(preview_ctnr, LV_ALIGN_TOP_MID, 0, 52);
+    lv_obj_set_style_clip_corner(preview_ctnr, true, 0);
 
-    /* Live preview image (hidden until camera is opened).
-     * STRETCH align is essential: the camera outputs 640×480 but the
-     * preview container is ~768×340 — without scaling, the bottom
-     * ~140 px of the image is clipped. */
-    preview_img = lv_image_create(preview);
-    lv_obj_set_size(preview_img, LV_PCT(100), LV_PCT(100));
+    /* Image widget — sized to exact preview pixels in preview_start() */
+    preview_img = lv_image_create(preview_ctnr);
     lv_obj_set_style_bg_opa(preview_img, LV_OPA_COVER, 0);
     lv_obj_set_style_bg_color(preview_img, lv_color_black(), 0);
-    lv_obj_center(preview_img);
-    lv_image_set_inner_align(preview_img, LV_IMAGE_ALIGN_STRETCH);
     lv_obj_add_flag(preview_img, LV_OBJ_FLAG_HIDDEN);
 
-    /* Placeholder text (hidden when preview is active) */
-    placeholder = lv_label_create(preview);
+    placeholder = lv_label_create(preview_ctnr);
     lv_label_set_text(placeholder, "Camera Preview");
     lv_obj_set_style_text_color(placeholder, lv_color_hex(0x455a64), 0);
     lv_obj_set_style_text_font(placeholder, &lv_font_montserrat_18, 0);
     lv_obj_center(placeholder);
 
-    /* ── Status label ─────────────────────────────────────────────── */
     label_status = lv_label_create(screen_camera);
     lv_label_set_text(label_status, "Ready");
     lv_obj_set_style_text_color(label_status, lv_color_hex(TEXT_GRAY), 0);
-    lv_obj_align_to(label_status, preview, LV_ALIGN_OUT_BOTTOM_MID, 0, 8);
+    lv_obj_align_to(label_status, preview_ctnr, LV_ALIGN_OUT_BOTTOM_MID, 0, 8);
 
     /* ── Action buttons ───────────────────────────────────────────── */
     lv_obj_t *row = lv_obj_create(screen_camera);
@@ -629,9 +558,7 @@ void ui_camera_page_create(void)
     lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_EVENLY,
                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
-    static const struct {
-        const char *l; lv_event_cb_t cb; uint32_t color;
-    } btns[] = {
+    static const struct { const char *l; lv_event_cb_t cb; uint32_t color; } btns[] = {
         {"Open Camera", open_cb,  ACCENT},
         {"Take Photo",  photo_cb, 0x1565c0},
         {"Record",      rec_cb,   0xc62828},
@@ -642,15 +569,11 @@ void ui_camera_page_create(void)
         lv_obj_set_style_bg_color(b, lv_color_hex(btns[i].color), 0);
         lv_obj_set_style_radius(b, 20, 0);
         lv_obj_add_event_cb(b, btns[i].cb, LV_EVENT_CLICKED, NULL);
-        lv_obj_t *l = lv_label_create(b);
-        lv_label_set_text(l, btns[i].l);
-        lv_obj_center(l);
+        lv_obj_t *l = lv_label_create(b); lv_label_set_text(l, btns[i].l); lv_obj_center(l);
     }
 
     LOG_INFO("Camera page created");
 }
 
 void ui_camera_page_show(void)
-{
-    if (screen_camera) lv_scr_load(screen_camera);
-}
+{ if (screen_camera) lv_scr_load(screen_camera); }
