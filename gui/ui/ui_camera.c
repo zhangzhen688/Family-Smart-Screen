@@ -57,11 +57,16 @@ extern lv_obj_t *g_main_screen;
 
 /* ── BMP writer (32-bit BGRA, bottom-up) ─────────────────────────────── */
 
-static void write_bmp(const char *path,
+static void write_bmp(const char *lvgl_path,
                       const uint8_t *pixels, int w, int h, int stride)
 {
-    FILE *f = fopen(path, "wb");
-    if (!f) return;
+    /* Strip LVGL drive prefix (e.g. "A:/tmp/foo.bmp" → "/tmp/foo.bmp").
+     * Standard fopen() doesn't understand "A:" — that's an LVGL convention. */
+    const char *real_path = lvgl_path;
+    if (real_path[0] && real_path[1] == ':') real_path += 2;
+
+    FILE *f = fopen(real_path, "wb");
+    if (!f) { LOG_ERROR("write_bmp: cannot open %s", real_path); return; }
 
     int row_bytes  = w * 4;
     int file_size  = 14 + 40 + row_bytes * h;

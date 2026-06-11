@@ -67,7 +67,8 @@
 #define LV_FS_STDIO_PATH        ""
 #define LV_FS_STDIO_CACHE_SIZE   4096
 
-/*── PNG decoder (built-in lodepng) ────────────────────────────────────*/
+/*── Image decoders ────────────────────────────────────────────────────*/
+#define LV_USE_BMP              1
 #define LV_USE_LODEPNG          1
 
 /*── Extras ────────────────────────────────────────────────────────────*/
