@@ -25,19 +25,45 @@
 
 #define CAM_BUF_COUNT  4
 
-static int  g_video_fd = -1;
-static int  g_streaming = 0;
-static char *g_buffers[CAM_BUF_COUNT];
-static size_t g_buf_lengths[CAM_BUF_COUNT];
+static int      g_video_fd = -1;
+static int      g_streaming = 0;
+static int      g_width = 0;
+static int      g_height = 0;
+static uint32_t g_pixel_format = 0;
+static char    *g_buffers[CAM_BUF_COUNT];
+static size_t   g_buf_lengths[CAM_BUF_COUNT];
 
 int camera_init(void)
 {
+    /* Already initialised — idempotent */
+    if (g_video_fd >= 0) {
+        LOG_INFO("Camera already initialised (fd=%d), reusing", g_video_fd);
+        return 0;
+    }
+
     struct v4l2_capability cap;
     struct v4l2_format fmt;
 
-    g_video_fd = open(CAM_DEVICE_NODE, O_RDWR);
+    /* Try configured device first, then fall back through /dev/video0..5 */
+    const char *paths[] = {
+        CAM_DEVICE_NODE,
+        "/dev/video0", "/dev/video1", "/dev/video2",
+        "/dev/video3", "/dev/video4", "/dev/video5",
+        NULL
+    };
+
+    g_video_fd = -1;
+    for (int i = 0; paths[i] != NULL; i++) {
+        g_video_fd = open(paths[i], O_RDWR);
+        if (g_video_fd >= 0) {
+            LOG_INFO("Opened camera device: %s", paths[i]);
+            break;
+        }
+    }
+
     if (g_video_fd < 0) {
-        LOG_ERROR("Cannot open %s: %s", CAM_DEVICE_NODE, strerror(errno));
+        LOG_ERROR("Cannot open any camera device (tried %s .. /dev/video5)",
+                  CAM_DEVICE_NODE);
         return -1;
     }
 
@@ -63,7 +89,11 @@ int camera_init(void)
 
     LOG_INFO("Camera: %s (driver: %s)", cap.card, cap.driver);
 
-    /* Set format: MJPEG 640x480 */
+    /* Set format: MJPEG 640x480.
+     * Note: this HIK 1080P camera reports YUYV support via VIDIOC_S_FMT
+     * but the hardware continues to output variable-size MJPEG frames
+     * regardless — a known UVC quirk.  We request MJPEG explicitly so
+     * the pixel-format metadata in the shm header is accurate. */
     memset(&fmt, 0, sizeof(fmt));
     fmt.type                = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     fmt.fmt.pix.width       = CAM_DEFAULT_WIDTH;
@@ -74,7 +104,6 @@ int camera_init(void)
     if (ioctl(g_video_fd, VIDIOC_S_FMT, &fmt) < 0) {
         LOG_ERROR("VIDIOC_S_FMT MJPEG failed: %s — trying YUYV",
                   strerror(errno));
-        /* Fallback: try YUYV */
         fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
         if (ioctl(g_video_fd, VIDIOC_S_FMT, &fmt) < 0) {
             LOG_ERROR("VIDIOC_S_FMT YUYV also failed");
@@ -83,19 +112,29 @@ int camera_init(void)
         }
     }
 
+    g_width        = fmt.fmt.pix.width;
+    g_height       = fmt.fmt.pix.height;
+    g_pixel_format = fmt.fmt.pix.pixelformat;
+
     LOG_INFO("Camera format: %dx%d %c%c%c%c",
-             fmt.fmt.pix.width, fmt.fmt.pix.height,
-             fmt.fmt.pix.pixelformat & 0xff,
-             (fmt.fmt.pix.pixelformat >> 8) & 0xff,
-             (fmt.fmt.pix.pixelformat >> 16) & 0xff,
-             (fmt.fmt.pix.pixelformat >> 24) & 0xff);
+             g_width, g_height,
+             g_pixel_format & 0xff,
+             (g_pixel_format >> 8) & 0xff,
+             (g_pixel_format >> 16) & 0xff,
+             (g_pixel_format >> 24) & 0xff);
 
     return 0;
 }
 
 int camera_start_stream(void)
 {
-    if (g_video_fd < 0 || g_streaming) return -1;
+    if (g_video_fd < 0) return -1;
+
+    /* Already streaming — idempotent */
+    if (g_streaming) {
+        LOG_INFO("Camera stream already active, reusing");
+        return 0;
+    }
 
     /* Request mmap buffers */
     struct v4l2_requestbuffers req;
@@ -248,5 +287,22 @@ void camera_exit(void)
         close(g_video_fd);
         g_video_fd = -1;
     }
+    g_width = g_height = 0;
+    g_pixel_format = 0;
     LOG_INFO("Camera closed");
+}
+
+int camera_get_width(void)
+{
+    return g_width;
+}
+
+int camera_get_height(void)
+{
+    return g_height;
+}
+
+uint32_t camera_get_pixel_format(void)
+{
+    return g_pixel_format;
 }

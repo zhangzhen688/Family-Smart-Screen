@@ -48,4 +48,22 @@ int camera_save_photo(const char *filename);
  */
 void camera_exit(void);
 
+/**
+ * Get the negotiated frame width.
+ * @return width in pixels, or 0 if not initialized.
+ */
+int camera_get_width(void);
+
+/**
+ * Get the negotiated frame height.
+ * @return height in pixels, or 0 if not initialized.
+ */
+int camera_get_height(void);
+
+/**
+ * Get the negotiated pixel format (V4L2_PIX_FMT_*).
+ * @return pixel format fourcc, or 0 if not initialized.
+ */
+uint32_t camera_get_pixel_format(void);
+
 #endif /* V4L2_CAPTURE_H */

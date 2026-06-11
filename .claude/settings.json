@@ -4,7 +4,18 @@
       "Bash(tar xf *)",
       "Bash(mkdir -p gui/ui gui/assets backend/device_server backend/camera_server backend/voice_server inc docs 2>/dev/null; echo \"dirs created\"; find . -maxdepth 1 -type d | sort)",
       "Bash(dpkg -l)",
-      "Bash(mkdir -p libs/jsonrpc && mv libs/jsonrpc-c/* libs/jsonrpc/ && mv libs/libev libs/jsonrpc/ && rmdir libs/jsonrpc-c && echo \"done\"; ls libs/jsonrpc/; echo \"===\"; ls libs/jsonrpc/libev/ | head -10)"
+      "Bash(mkdir -p libs/jsonrpc && mv libs/jsonrpc-c/* libs/jsonrpc/ && mv libs/libev libs/jsonrpc/ && rmdir libs/jsonrpc-c && echo \"done\"; ls libs/jsonrpc/; echo \"===\"; ls libs/jsonrpc/libev/ | head -10)",
+      "Bash(cmake ..)",
+      "Bash(make -j1 --trace)",
+      "Bash(cmake -S /home/zhang/Desktop/smart_screen -B /home/zhang/Desktop/smart_screen/build)",
+      "Read(//dev/**)",
+      "Bash(v4l2-ctl --list-devices)",
+      "Bash(./camera_server)",
+      "Bash(timeout 3 nc 127.0.0.1 1235)",
+      "Bash(pkill -f camera_server)",
+      "Bash(rm -f /dev/shm/camera_shm /dev/shm/sem.camera_sem_*)",
+      "Read(//tmp/**)",
+      "Bash(./build/backend/camera_server)"
     ],
     "additionalDirectories": [
       "/home/zhang/Desktop/smart_screen/gui",

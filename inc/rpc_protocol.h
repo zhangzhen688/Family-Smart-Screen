@@ -38,6 +38,8 @@
 #define RPC_METHOD_CAMERA_STOP_RECORDING  "camera_stop_recording"
 #define RPC_METHOD_CAMERA_LIST_PHOTOS     "camera_list_photos"
 #define RPC_METHOD_CAMERA_DELETE_PHOTO    "camera_delete_photo"
+#define RPC_METHOD_CAMERA_START_PREVIEW  "camera_start_preview"
+#define RPC_METHOD_CAMERA_STOP_PREVIEW   "camera_stop_preview"
 
 /* ── Voice Server Methods ───────────────────────────────────────────── */
 

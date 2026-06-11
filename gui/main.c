@@ -14,6 +14,7 @@
 #include "lv_conf.h"
 #include "common.h"
 #include "rpc_client.h"
+#include "camera_reader.h"
 #include "xiaozhi_ipc.h"
 
 /* ── External UI page init functions ────────────────────────────────── */

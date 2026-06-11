@@ -16,6 +16,7 @@
 #include "jsonrpc-c.h"
 #include "rpc_protocol.h"
 #include "v4l2_capture.h"
+#include "camera_streamer.h"
 
 static struct jrpc_server my_server;
 static volatile int running = 1;
@@ -202,6 +203,33 @@ cJSON *rpc_camera_delete_photo(jrpc_context *ctx, cJSON *params, cJSON *id)
     return result;
 }
 
+/* ── RPC: camera_start_preview ────────────────────────────────────────── */
+cJSON *rpc_camera_start_preview(jrpc_context *ctx, cJSON *params, cJSON *id)
+{
+    (void)ctx; (void)params;
+    cJSON *result = cJSON_CreateObject();
+
+    if (camera_streamer_start() < 0) {
+        cJSON_AddBoolToObject(result, "ok", false);
+        cJSON_AddStringToObject(result, "error", "Cannot start preview streamer");
+        return result;
+    }
+
+    cJSON_AddBoolToObject(result, "ok", true);
+    return result;
+}
+
+/* ── RPC: camera_stop_preview ─────────────────────────────────────────── */
+cJSON *rpc_camera_stop_preview(jrpc_context *ctx, cJSON *params, cJSON *id)
+{
+    (void)ctx; (void)params;
+    camera_streamer_stop();
+
+    cJSON *result = cJSON_CreateObject();
+    cJSON_AddBoolToObject(result, "ok", true);
+    return result;
+}
+
 int main(void)
 {
     LOG_INFO("====================================");
@@ -230,8 +258,12 @@ int main(void)
             RPC_METHOD_CAMERA_LIST_PHOTOS, NULL);
     jrpc_register_procedure(&my_server, rpc_camera_delete_photo,
             RPC_METHOD_CAMERA_DELETE_PHOTO, NULL);
+    jrpc_register_procedure(&my_server, rpc_camera_start_preview,
+            RPC_METHOD_CAMERA_START_PREVIEW, NULL);
+    jrpc_register_procedure(&my_server, rpc_camera_stop_preview,
+            RPC_METHOD_CAMERA_STOP_PREVIEW, NULL);
 
-    LOG_INFO("Registered 8 procedures");
+    LOG_INFO("Registered 10 procedures");
     LOG_INFO("Server ready.");
 
     jrpc_server_run(&my_server);

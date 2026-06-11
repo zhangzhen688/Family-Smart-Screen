@@ -14,8 +14,9 @@ target_link_libraries(device_server jsonrpc cjson pthread m)
 add_executable(camera_server
     camera_server/rpc_server.c
     camera_server/v4l2_capture.c
+    camera_server/camera_streamer.c
 )
-target_link_libraries(camera_server jsonrpc cjson pthread m)
+target_link_libraries(camera_server jsonrpc cjson pthread m rt)
 
 # ── Voice Server (port 1236 + UDP IPC to xiaozhi control_center) ──────
 add_executable(voice_server

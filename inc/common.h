@@ -27,7 +27,9 @@
 
 #define CAM_DEFAULT_WIDTH   640
 #define CAM_DEFAULT_HEIGHT  480
-#define CAM_DEVICE_NODE     "/dev/video0"
+/* Use by-path symlink — stable across USB re-enumerations.
+   If the camera changes USB port, update this path. */
+#define CAM_DEVICE_NODE     "/dev/v4l/by-path/pci-0000:02:03.0-usb-0:1:1.0-video-index0"
 #define CAM_PHOTO_DIR       "./photos"
 
 /* ── Convenience Macros ─────────────────────────────────────────────── */

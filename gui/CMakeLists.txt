@@ -8,6 +8,7 @@ set(GUI_SRCS
     main.c
     rpc_client.c
     xiaozhi_ipc.c
+    camera_reader.c
     ui/ui_main.c
     ui/ui_camera.c
     ui/ui_album.c
@@ -25,7 +26,7 @@ target_include_directories(smart_gui PRIVATE
     ${FREETYPE_INCLUDE_DIRS}
 )
 
-set(GUI_LIBS lvgl cjson ${SDL2_LIBRARIES} ${FREETYPE_LIBRARIES} pthread m)
+set(GUI_LIBS lvgl cjson ${SDL2_LIBRARIES} ${FREETYPE_LIBRARIES} pthread m rt jpeg)
 if(SDL2_image_FOUND)
     target_include_directories(smart_gui PRIVATE ${SDL2_IMAGE_INCLUDE_DIRS})
     list(APPEND GUI_LIBS ${SDL2_IMAGE_LIBRARIES})
