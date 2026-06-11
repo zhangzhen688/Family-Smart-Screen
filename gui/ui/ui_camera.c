@@ -1,13 +1,15 @@
 /**
  * @file ui_camera.c — Camera live preview.
  *
- * Frame pipeline:
- *   shm → JPEG validate → decode (cam res) → bilinear scale (view res)
- *   → write BMP → lv_image_set_src(file path)
+ * Pipeline: shm → JPEG validate → decode(cam res) → bilinear scale(view res)
+ *           → lv_image_dsc_t XRGB8888 → LVGL display
  *
- * Display uses LVGL's built-in BMP decoder — the most reliable image
- * path in LVGL v9.  Two alternating BMP files provide tear-free display.
- * All resolutions are read at runtime; nothing is hardcoded.
+ * Key design decisions:
+ *   - XRGB8888 (not ARGB8888): alpha=255 hardcoded, avoids premultiply issues
+ *   - Exact-size buffers: image src matches widget pixel size → no LVGL scaling
+ *   - Ping-pong buffers: two independent lv_image_dsc_t, alternated each frame
+ *   - lv_obj_invalidate: force LVGL to re-read the image source each swap
+ *   - All resolutions dynamic: camera from shm, view from LVGL widget
  */
 #include "lvgl.h"
 #include "common.h"
@@ -28,78 +30,59 @@
 #define TEXT_WHITE   0xe8eaed
 #define TEXT_GRAY    0x8e9aaf
 
-/* Double-buffer file paths — writes to /tmp (tmpfs, in-memory, fast) */
-#define BMP_PATH_A    "A:/tmp/preview_A.bmp"
-#define BMP_PATH_B    "A:/tmp/preview_B.bmp"
+/* ── State ────────────────────────────────────────────────────────────── */
 
-/* ── Static state ─────────────────────────────────────────────────────── */
+static lv_obj_t    *screen_camera = NULL, *label_status = NULL;
+static lv_obj_t    *preview_img   = NULL;
+static lv_obj_t    *placeholder   = NULL;
+static lv_obj_t    *preview_ctnr  = NULL;
 
-static lv_obj_t  *screen_camera = NULL, *label_status = NULL;
-static lv_obj_t  *preview_img   = NULL;
-static lv_obj_t  *placeholder   = NULL;
-static lv_obj_t  *preview_ctnr  = NULL;
+static int          g_cam_w  = 0, g_cam_h  = 0;   /* camera resolution       */
+static int          g_view_w = 0, g_view_h = 0;   /* preview container size  */
 
-/* Camera → view dimensions (read at runtime, NOT hardcoded) */
-static int       g_cam_w = 0, g_cam_h = 0;
-static int       g_view_w = 0, g_view_h = 0;
+/* Ping-pong image descriptors + pixel buffers */
+static lv_image_dsc_t  g_dsc[2];
+static uint8_t        *g_rgb[2];     /* malloc'd pixel data for each dsc    */
+static int             g_cur = 0;    /* which dsc is currently displayed    */
 
-/* Buffers */
-static uint8_t  *g_decode_buf = NULL;   /* cam-res temp (w*h*4)           */
-static uint8_t  *g_scale_buf  = NULL;   /* view-res ping-pong [2]         */
-static int       g_buf_idx    = 0;      /* 0→A.bmp, 1→B.bmp               */
+static uint8_t        *g_decode_buf; /* temp: camera-resolution decode buf  */
 
-static lv_timer_t *preview_timer = NULL;
-static bool        g_cam_running = false, g_preview_active = false;
-static bool        g_recording   = false;
-static int         g_cam_fd      = -1;
+static lv_timer_t     *preview_timer = NULL;
+static bool             g_cam_running = false, g_preview_active = false;
+static bool             g_recording   = false;
+static int              g_cam_fd      = -1;
 
 extern lv_obj_t *g_main_screen;
 
-/* ── BMP writer (32-bit BGRA, bottom-up) ─────────────────────────────── */
+/* ── Buffer helpers ───────────────────────────────────────────────────── */
 
-static void write_bmp(const char *lvgl_path,
-                      const uint8_t *pixels, int w, int h, int stride)
+static void free_dsc(int i)
 {
-    /* Strip LVGL drive prefix (e.g. "A:/tmp/foo.bmp" → "/tmp/foo.bmp").
-     * Standard fopen() doesn't understand "A:" — that's an LVGL convention. */
-    const char *real_path = lvgl_path;
-    if (real_path[0] && real_path[1] == ':') real_path += 2;
-
-    FILE *f = fopen(real_path, "wb");
-    if (!f) { LOG_ERROR("write_bmp: cannot open %s", real_path); return; }
-
-    int row_bytes  = w * 4;
-    int file_size  = 14 + 40 + row_bytes * h;
-    uint32_t u32;
-    int32_t  i32;
-
-    /* Bitmap file header (14 bytes) */
-    fputc('B', f); fputc('M', f);
-    u32 = (uint32_t)file_size;     fwrite(&u32, 4, 1, f);
-    u32 = 0;                       fwrite(&u32, 4, 1, f); /* reserved  */
-    u32 = 14 + 40;                 fwrite(&u32, 4, 1, f); /* data offset */
-
-    /* DIB header — BITMAPINFOHEADER (40 bytes) */
-    u32 = 40;                      fwrite(&u32, 4, 1, f); /* header size   */
-    i32 = (int32_t)w;              fwrite(&i32, 4, 1, f); /* width         */
-    i32 = (int32_t)h;              fwrite(&i32, 4, 1, f); /* height (neg = top-down) */
-    uint16_t u16 = 1;              fwrite(&u16, 2, 1, f); /* planes        */
-    u16 = 32;                      fwrite(&u16, 2, 1, f); /* bpp           */
-    u32 = 0;                       fwrite(&u32, 4, 1, f); /* compression   */
-    u32 = (uint32_t)(row_bytes * h); fwrite(&u32, 4, 1, f); /* image size  */
-    i32 = 2835;                    fwrite(&i32, 4, 1, f); /* x dpi         */
-    i32 = 2835;                    fwrite(&i32, 4, 1, f); /* y dpi         */
-    u32 = 0;                       fwrite(&u32, 4, 1, f); /* colors used   */
-    u32 = 0;                       fwrite(&u32, 4, 1, f); /* colors important */
-
-    /* Pixel rows — bottom to top, BGRA byte order */
-    for (int y = h - 1; y >= 0; y--)
-        fwrite(pixels + y * stride, 1, row_bytes, f);
-
-    fclose(f);
+    if (g_rgb[i]) { free(g_rgb[i]); g_rgb[i] = NULL; }
+    memset(&g_dsc[i], 0, sizeof(g_dsc[i]));
 }
 
-/* ── Bilinear scale BGRA → BGRA (64-bit math) ────────────────────────── */
+static int alloc_dsc(int i, int w, int h)
+{
+    free_dsc(i);
+    int stride = w * 4;
+    size_t sz  = (size_t)stride * (size_t)h;
+    uint8_t *rgb = malloc(sz);
+    if (!rgb) return -1;
+    memset(rgb, 0, sz);
+
+    g_dsc[i].header.magic  = LV_IMAGE_HEADER_MAGIC;
+    g_dsc[i].header.cf     = LV_COLOR_FORMAT_XRGB8888;  /* no alpha channel */
+    g_dsc[i].header.w      = (uint16_t)w;
+    g_dsc[i].header.h      = (uint16_t)h;
+    g_dsc[i].header.stride = (uint16_t)stride;
+    g_dsc[i].data_size     = (uint32_t)sz;
+    g_dsc[i].data          = rgb;
+    g_rgb[i] = rgb;
+    return 0;
+}
+
+/* ── Bilinear scale BGRA → BGRX ──────────────────────────────────────── */
 
 static void scale_bilinear(const uint8_t *src, int sw, int sh, int sstride,
                            uint8_t *dst, int dw, int dh, int dstride)
@@ -121,27 +104,28 @@ static void scale_bilinear(const uint8_t *src, int sw, int sh, int sstride,
             const uint8_t *p11 = src + sy2 * sstride + sx2 * 4;
             uint8_t *out = drow + dx * 4;
 
-            for (int c = 0; c < 4; c++) {
+            /* Blend B, G, R channels only; force A = 0xFF (XRGB) */
+            for (int c = 0; c < 3; c++) {
                 int t = (int)(((int64_t)p00[c] * (65536 - fx) + (int64_t)p01[c] * fx) >> 16);
                 int b = (int)(((int64_t)p10[c] * (65536 - fx) + (int64_t)p11[c] * fx) >> 16);
                 out[c] = (uint8_t)(((int64_t)t * (65536 - fy) + (int64_t)b * fy) >> 16);
             }
+            out[3] = 0xFF;  /* alpha = fully opaque */
         }
     }
 }
 
-/* ── JPEG decoder (silent, validates completion) ──────────────────────── */
+/* ── JPEG decoder (silent, validates completeness) ────────────────────── */
 
 struct jpeg_err_mgr { struct jpeg_error_mgr pub; jmp_buf jb; int fatal; };
-
-static void silent_emit(j_common_ptr c, int l) { (void)c; (void)l; }
+static void jpeg_silent(j_common_ptr c, int l) { (void)c; (void)l; }
 static void jpeg_fatal(j_common_ptr c)
 { struct jpeg_err_mgr *e = (struct jpeg_err_mgr *)c->err; e->fatal = 1; longjmp(e->jb, 1); }
 
 static inline int is_jpeg(const uint8_t *d, size_t s)
 { return s >= 2 && d[0] == 0xFF && d[1] == 0xD8; }
 
-static int jpeg_to_rgb(const uint8_t *data, size_t size,
+static int jpeg_decode(const uint8_t *data, size_t size,
                        uint8_t *rgb, int stride, int max_w, int max_h,
                        int *out_w, int *out_h)
 {
@@ -153,14 +137,14 @@ static int jpeg_to_rgb(const uint8_t *data, size_t size,
     memset(&jerr, 0, sizeof(jerr));
     cinfo.err = jpeg_std_error(&jerr.pub);
     jerr.pub.error_exit   = jpeg_fatal;
-    jerr.pub.emit_message = silent_emit;
+    jerr.pub.emit_message = jpeg_silent;
 
     if (setjmp(jerr.jb)) { jpeg_destroy_decompress(&cinfo); return -1; }
 
     jpeg_create_decompress(&cinfo);
     jpeg_mem_src(&cinfo, data, size);
     jpeg_read_header(&cinfo, TRUE);
-    cinfo.out_color_space = JCS_EXT_BGRA;
+    cinfo.out_color_space = JCS_EXT_BGRX;   /* B,G,R,0xFF → XRGB8888 */
     jpeg_start_decompress(&cinfo);
 
     int dw = (int)cinfo.output_width, dh = (int)cinfo.output_height;
@@ -178,28 +162,26 @@ static int jpeg_to_rgb(const uint8_t *data, size_t size,
     return (ok && !jerr.fatal) ? 0 : -1;
 }
 
-/* ── Frame processing: read → decode → scale → BMP → display ──────────── */
+/* ── Frame pipeline ───────────────────────────────────────────────────── */
 
-static int process_one_frame(void)
+static int process_frame(void)
 {
     uint8_t *data; size_t size;
     if (camera_reader_read_frame(&data, &size) != 0) return -1;
 
-    /* MJPEG: skip garbage, decode, validate */
+    /* Drain garbage frames, find a valid JPEG */
     for (int retry = 0; retry < 4; retry++) {
         if (!is_jpeg(data, size)) goto next;
 
         int dw, dh;
-        if (jpeg_to_rgb(data, size, g_decode_buf, g_cam_w * 4,
+        if (jpeg_decode(data, size, g_decode_buf, g_cam_w * 4,
                         g_cam_w, g_cam_h, &dw, &dh) == 0) {
-            /* Camera resolution changed? Realloc decode buf */
             if (dw != g_cam_w || dh != g_cam_h) {
                 g_cam_w = dw; g_cam_h = dh;
                 free(g_decode_buf);
                 g_decode_buf = malloc((size_t)dw * (size_t)dh * 4);
                 if (!g_decode_buf) return -1;
-                /* Re-decode */
-                if (jpeg_to_rgb(data, size, g_decode_buf, dw * 4,
+                if (jpeg_decode(data, size, g_decode_buf, dw * 4,
                                 dw, dh, &dw, &dh) != 0) return -1;
             }
             goto decoded;
@@ -207,27 +189,25 @@ static int process_one_frame(void)
 next:
         if (camera_reader_read_frame(&data, &size) != 0) return -1;
     }
-    return -1; /* no valid frame after draining */
+    return -1;
 
 decoded:
-    /* Bilinear scale camera → view size */
+    /* Scale camera → view size into the OTHER buffer */
+    int next = g_cur ^ 1;
     scale_bilinear(g_decode_buf, g_cam_w, g_cam_h, g_cam_w * 4,
-                   g_scale_buf, g_view_w, g_view_h, g_view_w * 4);
+                   g_rgb[next], g_view_w, g_view_h, g_view_w * 4);
 
-    /* Write to alternating BMP file and display */
-    int next = g_buf_idx ^ 1;
-    const char *path = next ? BMP_PATH_B : BMP_PATH_A;
-    write_bmp(path, g_scale_buf, g_view_w, g_view_h, g_view_w * 4);
-
-    lv_image_set_src(preview_img, path);
-    g_buf_idx = next;
+    /* Set the new source and invalidate to force LVGL to re-read */
+    lv_image_set_src(preview_img, &g_dsc[next]);
+    lv_obj_invalidate(preview_img);
+    g_cur = next;
     return 0;
 }
 
 static void preview_timer_cb(lv_timer_t *t)
 {
     (void)t;
-    if (g_preview_active) process_one_frame();
+    if (g_preview_active) process_frame();
 }
 
 /* ── Start / stop ─────────────────────────────────────────────────────── */
@@ -239,8 +219,9 @@ static void preview_stop(void)
 
     camera_reader_deinit();
 
+    for (int i = 0; i < 2; i++) free_dsc(i);
+    g_cur = 0;
     free(g_decode_buf); g_decode_buf = NULL;
-    free(g_scale_buf);  g_scale_buf  = NULL;
 
     if (g_cam_fd > 0) rpc_call_void(g_cam_fd, RPC_METHOD_CAMERA_STOP_PREVIEW);
 
@@ -249,56 +230,49 @@ static void preview_stop(void)
         lv_obj_add_flag(preview_img, LV_OBJ_FLAG_HIDDEN);
     }
     if (placeholder) lv_obj_clear_flag(placeholder, LV_OBJ_FLAG_HIDDEN);
-
-    /* Clean up temp BMP files */
-    remove(BMP_PATH_A + 2);  /* strip "A:" prefix */
-    remove(BMP_PATH_B + 2);
 }
 
 static int preview_start(void)
 {
     if (camera_reader_init() < 0) return -1;
 
-    /* ── Camera resolution: read from shm, works with ANY camera ──── */
     camera_reader_get_dimensions(&g_cam_w, &g_cam_h);
     if (g_cam_w <= 0) g_cam_w = 640;
     if (g_cam_h <= 0) g_cam_h = 480;
 
-    /* ── View resolution: read from actual LVGL widget at runtime ──── */
+    /* Read preview container content size at runtime */
     g_view_w = lv_obj_get_content_width(preview_ctnr);
     g_view_h = lv_obj_get_content_height(preview_ctnr);
-    if (g_view_w <= 0) {
-        /* Layout hasn't happened yet — use screen-based estimate */
-        g_view_w = lv_obj_get_content_width(screen_camera);
-        g_view_h = 340;
-    }
-    if (g_view_w <= 0) g_view_w = 800;
-    if (g_view_h <= 0) g_view_h = 340;
+    if (g_view_w <= 0) g_view_w = lv_obj_get_content_width(screen_camera) - 4;
+    if (g_view_w <= 0) g_view_w = 764;
+    if (g_view_h <= 0) g_view_h = 336;
 
     LOG_INFO("Preview: cam %dx%d → view %dx%d", g_cam_w, g_cam_h, g_view_w, g_view_h);
 
-    /* ── Allocate buffers ─────────────────────────────────────────── */
+    /* Temp buffer for JPEG decode at camera resolution */
     g_decode_buf = malloc((size_t)g_cam_w * (size_t)g_cam_h * 4);
-    g_scale_buf  = malloc((size_t)g_view_w * (size_t)g_view_h * 4);
-    if (!g_decode_buf || !g_scale_buf) {
-        free(g_decode_buf); free(g_scale_buf);
-        g_decode_buf = g_scale_buf = NULL;
-        camera_reader_deinit();
-        return -1;
-    }
-    memset(g_scale_buf, 0, (size_t)g_view_w * (size_t)g_view_h * 4);
-    g_buf_idx = 0;
+    if (!g_decode_buf) { camera_reader_deinit(); return -1; }
 
-    /* ── Show image widget ────────────────────────────────────────── */
+    /* Two image descriptors at exact view size */
+    for (int i = 0; i < 2; i++) {
+        if (alloc_dsc(i, g_view_w, g_view_h) < 0) {
+            for (int j = 0; j < i; j++) free_dsc(j);
+            free(g_decode_buf); g_decode_buf = NULL;
+            camera_reader_deinit();
+            return -1;
+        }
+    }
+    g_cur = 0;
+
+    /* Size the image widget to match our buffers exactly */
     lv_obj_set_size(preview_img, g_view_w, g_view_h);
     if (placeholder) lv_obj_add_flag(placeholder, LV_OBJ_FLAG_HIDDEN);
     if (preview_img) lv_obj_clear_flag(preview_img, LV_OBJ_FLAG_HIDDEN);
 
-    /* ── Start timer ──────────────────────────────────────────────── */
     preview_timer = lv_timer_create(preview_timer_cb, 33, NULL);
     if (!preview_timer) {
+        for (int i = 0; i < 2; i++) free_dsc(i);
         free(g_decode_buf); g_decode_buf = NULL;
-        free(g_scale_buf);  g_scale_buf  = NULL;
         camera_reader_deinit();
         return -1;
     }
@@ -443,7 +417,7 @@ void ui_camera_page_create(void)
     lv_obj_align(preview_ctnr, LV_ALIGN_TOP_MID, 0, 52);
     lv_obj_set_style_clip_corner(preview_ctnr, true, 0);
 
-    /* Image widget — sized dynamically when camera opens */
+    /* Image widget */
     preview_img = lv_image_create(preview_ctnr);
     lv_obj_set_style_bg_opa(preview_img, LV_OPA_COVER, 0);
     lv_obj_set_style_bg_color(preview_img, lv_color_black(), 0);
