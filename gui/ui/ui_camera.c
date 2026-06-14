@@ -190,12 +190,14 @@ static int process_frame(void)
 
     lv_image_set_src(preview_img, &g_dsc[next]);
     lv_obj_invalidate(preview_img);
+    lv_obj_invalidate(preview_ctnr);  /* also invalidate parent */
     g_cur = next;
 
     /* First frame: reveal image (was hidden to avoid blank flash) */
     if (placeholder && !lv_obj_has_flag(placeholder, LV_OBJ_FLAG_HIDDEN)) {
         lv_obj_add_flag(placeholder, LV_OBJ_FLAG_HIDDEN);
         lv_obj_clear_flag(preview_img, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_invalidate(preview_ctnr);  /* full redraw on reveal */
     }
 
     return 0;
@@ -261,8 +263,9 @@ static int preview_start(void)
     }
     g_cur = 0;
 
-    /* Size the image widget to match our buffers exactly */
+    /* Size and position the image widget to exactly fill the container */
     lv_obj_set_size(preview_img, g_view_w, g_view_h);
+    lv_obj_set_pos(preview_img, 0, 0);
     /* Set initial source and keep hidden until first valid frame */
     lv_image_set_src(preview_img, &g_dsc[0]);
     lv_obj_add_flag(preview_img, LV_OBJ_FLAG_HIDDEN);
@@ -414,7 +417,7 @@ void ui_camera_page_create(void)
     lv_obj_set_style_bg_opa(preview_ctnr, LV_OPA_COVER, 0);
     lv_obj_set_style_pad_all(preview_ctnr, 0, 0);
     lv_obj_align(preview_ctnr, LV_ALIGN_TOP_MID, 0, 52);
-    lv_obj_set_style_clip_corner(preview_ctnr, true, 0);
+    lv_obj_set_style_clip_corner(preview_ctnr, false, 0);
 
     /* Image widget */
     preview_img = lv_image_create(preview_ctnr);
