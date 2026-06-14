@@ -21,7 +21,7 @@
 #define LV_USE_SDL          1
 #if LV_USE_SDL
     #define LV_SDL_INCLUDE_PATH    <SDL2/SDL.h>
-    #define LV_SDL_RENDER_MODE     LV_DISPLAY_RENDER_MODE_DIRECT
+    #define LV_SDL_RENDER_MODE     LV_DISPLAY_RENDER_MODE_FULL
     #define LV_SDL_BUF_COUNT       2
     #define LV_SDL_FULLSCREEN      0
     #define LV_SDL_DIRECT_EXIT     0

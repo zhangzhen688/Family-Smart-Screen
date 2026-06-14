@@ -105,9 +105,16 @@ int camera_reader_read_frame(uint8_t **out_buf, size_t *out_size)
 
     g_last_seq = slot->frame_seq;
 
-    /* Return pointer directly into shm — zero-copy read */
-    *out_buf  = slot->data;
+    /* Copy frame to local buffer before releasing the slot.
+     * Prevents producer from overwriting data mid-decode. */
+    static uint8_t frame_copy[CAMERA_SHM_MAX_FRAME];
     *out_size = slot->data_size;
+    if (*out_size <= CAMERA_SHM_MAX_FRAME) {
+        memcpy(frame_copy, slot->data, *out_size);
+        *out_buf = frame_copy;
+    } else {
+        *out_buf = slot->data;  /* fallback: shouldn't happen */
+    }
 
     /* Advance read cursor and signal an empty slot to the producer */
     g_hdr->read_idx = (idx + 1) % CAMERA_SHM_NUM_SLOTS;

@@ -168,39 +168,36 @@ static int process_frame(void)
 {
     uint8_t *data; size_t size;
     if (camera_reader_read_frame(&data, &size) != 0) return -1;
+    if (!is_jpeg(data, size)) return -1;
 
-    /* Drain garbage frames, find a valid JPEG */
-    for (int retry = 0; retry < 4; retry++) {
-        if (!is_jpeg(data, size)) goto next;
+    int dw, dh;
+    if (jpeg_decode(data, size, g_decode_buf, g_cam_w * 4,
+                    g_cam_w, g_cam_h, &dw, &dh) != 0) return -1;
 
-        int dw, dh;
-        if (jpeg_decode(data, size, g_decode_buf, g_cam_w * 4,
-                        g_cam_w, g_cam_h, &dw, &dh) == 0) {
-            if (dw != g_cam_w || dh != g_cam_h) {
-                g_cam_w = dw; g_cam_h = dh;
-                free(g_decode_buf);
-                g_decode_buf = malloc((size_t)dw * (size_t)dh * 4);
-                if (!g_decode_buf) return -1;
-                if (jpeg_decode(data, size, g_decode_buf, dw * 4,
-                                dw, dh, &dw, &dh) != 0) return -1;
-            }
-            goto decoded;
-        }
-next:
-        if (camera_reader_read_frame(&data, &size) != 0) return -1;
+    if (dw != g_cam_w || dh != g_cam_h) {
+        g_cam_w = dw; g_cam_h = dh;
+        free(g_decode_buf);
+        g_decode_buf = malloc((size_t)dw * (size_t)dh * 4);
+        if (!g_decode_buf) return -1;
+        if (jpeg_decode(data, size, g_decode_buf, dw * 4,
+                        dw, dh, &dw, &dh) != 0) return -1;
     }
-    return -1;
 
-decoded:
-    /* Scale camera → view size into the OTHER buffer */
+    /* Scale camera → view into the OTHER buffer (ping-pong) */
     int next = g_cur ^ 1;
     scale_bilinear(g_decode_buf, g_cam_w, g_cam_h, g_cam_w * 4,
                    g_rgb[next], g_view_w, g_view_h, g_view_w * 4);
 
-    /* Set the new source and invalidate to force LVGL to re-read */
     lv_image_set_src(preview_img, &g_dsc[next]);
     lv_obj_invalidate(preview_img);
     g_cur = next;
+
+    /* First frame: reveal image (was hidden to avoid blank flash) */
+    if (placeholder && !lv_obj_has_flag(placeholder, LV_OBJ_FLAG_HIDDEN)) {
+        lv_obj_add_flag(placeholder, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(preview_img, LV_OBJ_FLAG_HIDDEN);
+    }
+
     return 0;
 }
 
@@ -266,8 +263,10 @@ static int preview_start(void)
 
     /* Size the image widget to match our buffers exactly */
     lv_obj_set_size(preview_img, g_view_w, g_view_h);
-    if (placeholder) lv_obj_add_flag(placeholder, LV_OBJ_FLAG_HIDDEN);
-    if (preview_img) lv_obj_clear_flag(preview_img, LV_OBJ_FLAG_HIDDEN);
+    /* Set initial source and keep hidden until first valid frame */
+    lv_image_set_src(preview_img, &g_dsc[0]);
+    lv_obj_add_flag(preview_img, LV_OBJ_FLAG_HIDDEN);
+    if (placeholder) lv_obj_clear_flag(placeholder, LV_OBJ_FLAG_HIDDEN);
 
     preview_timer = lv_timer_create(preview_timer_cb, 33, NULL);
     if (!preview_timer) {
