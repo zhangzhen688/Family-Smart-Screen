@@ -44,9 +44,9 @@ echo "[1/7] Device Server (port 1234)"
 PIDS="$PIDS $!"
 sleep 1
 
-# 2. Camera server
+# 2. Camera server (run from BUILD_DIR so photos go to same place as GUI)
 echo "[2/7] Camera Server (port 1235)"
-"$BUILD_DIR/backend/camera_server" &
+( cd "$BUILD_DIR" && "$BUILD_DIR/backend/camera_server" ) &
 PIDS="$PIDS $!"
 sleep 1
 

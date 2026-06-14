@@ -55,7 +55,7 @@ static void refresh_list(void)
 {
     lv_obj_clean(list_box);
 
-    DIR *dir = opendir("./photos");
+    DIR *dir = opendir(CAM_PHOTO_DIR);
     if (!dir) {
         lv_obj_t *msg = lv_label_create(list_box);
         lv_label_set_text(msg, "No photos directory.\n"
@@ -89,7 +89,7 @@ static void refresh_list(void)
         if (is_bmp) {
             icon = lv_image_create(row);
             char lv_path[512];
-            snprintf(lv_path, sizeof(lv_path), "A:./photos/%s", e->d_name);
+            snprintf(lv_path, sizeof(lv_path), "A:%s/%s", CAM_PHOTO_DIR, e->d_name);
             lv_image_set_src(icon, lv_path);
             lv_obj_set_size(icon, 36, 36);
             lv_obj_align(icon, LV_ALIGN_LEFT_MID, 0, 0);
