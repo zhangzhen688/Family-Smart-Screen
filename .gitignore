@@ -36,3 +36,19 @@ refs/
 
 # XiaoZhi config (contains device UUID)
 /etc/xiaozhi.cfg
+
+# Kernel driver build artifacts
+*.ko
+*.mod.c
+*.mod
+*.cmd
+modules.order
+Module.symvers
+.tmp_versions/
+
+# Driver test binaries
+driver/*/test_ap3216
+driver/*/led_test
+driver/*/sg90_test
+driver/*/test
+driver/*/*_test

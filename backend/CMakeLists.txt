@@ -7,7 +7,9 @@ add_executable(device_server
     device_server/dev_dht11.c
     device_server/dev_sg90.c
     device_server/dev_ap3216c.c
+    device_server/driver_manager.c
 )
+target_include_directories(device_server PRIVATE ${CMAKE_SOURCE_DIR}/inc)
 target_link_libraries(device_server jsonrpc cjson pthread m)
 
 # ── Camera Server (port 1235) ─────────────────────────────────────────
