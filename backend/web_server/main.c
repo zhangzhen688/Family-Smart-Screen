@@ -18,6 +18,7 @@
 #include "http_server.h"
 #include "rpc_protocol.h"
 #include "rpc_client.h"
+#include "webrtc_protocol.h"
 #include "v4l2_capture.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,12 +26,17 @@
 #include <signal.h>
 #include <unistd.h>
 #include <time.h>
+#include <errno.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #define WEB_PORT 8080
 
 static volatile int g_running = 1;
 static int g_dev_fd = -1;
 static int g_cam_fd = -1;
+static int g_webrtc_fd = -1;
 
 /* ── Embedded mobile web UI HTML ────────────────────────────────────── */
 static const char *INDEX_HTML =
@@ -109,10 +115,12 @@ static const char *INDEX_HTML =
 "<div class=\"curtain-row\"><label>Position: <span id=\"curtain-val\">50%</span></label>"
 "<input type=\"range\" min=\"0\" max=\"180\" value=\"90\" id=\"curtain\" onchange=\"setCurtain(this.value)\"></div></div>"
 "<div class=\"section\"><div class=\"section-title\">Camera</div>"
-"<div class=\"camera-box\"><img id=\"cam\" src=\"/camera/snapshot\" onerror=\"this.style.display='none'\">"
+"<div class=\"camera-box\"><canvas id=\"webrtc-canvas\" style=\"display:none;width:100%;height:100%;object-fit:contain\"></canvas>"
+"<img id=\"cam\" src=\"/camera/snapshot\" onerror=\"this.style.display='none'\">"
 "<span class=\"placeholder\" id=\"cam-placeholder\">Camera Offline</span></div>"
 "<div style=\"text-align:center;margin-bottom:16px\">"
-"<button class=\"btn btn-primary\" onclick=\"snapshot()\">Take Photo</button>"
+"<button class=\"btn btn-primary\" id=\"btn-live\" onclick=\"toggleLive()\">Live Stream</button>"
+"<button class=\"btn btn-green\" onclick=\"snapshot()\">Take Photo</button>"
 "<button class=\"btn btn-green\" onclick=\"refreshCam()\">Refresh</button>"
 "</div></div>"
 "<div class=\"section\"><div class=\"section-title\">Voice Assistant</div>"
@@ -160,6 +168,62 @@ static const char *INDEX_HTML =
 "document.getElementById('cam').style.display='block'}"
 "function voiceCmd(){fetch('/api/voice',{method:'POST',headers:{'Content-Type':'application/json'},"
 "body:JSON.stringify({action:'listen'})}).then(()=>loadStatus())}"
+"/* ── WebRTC Live Stream ──────────────────────────────────────── */"
+"var pc=null,dc=null,liveActive=false;"
+"function startWebRTC(){"
+"var canvas=document.getElementById('webrtc-canvas');"
+"pc=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});"
+"dc=pc.createDataChannel('video',{ordered:true});"
+"dc.binaryType='arraybuffer';"
+"dc.onopen=function(){console.log('DataChannel open');};"
+"dc.onclose=function(){console.log('DataChannel closed');};"
+"dc.onmessage=function(e){"
+"var blob=new Blob([e.data],{type:'image/jpeg'});"
+"createImageBitmap(blob).then(function(bmp){"
+"canvas.width=bmp.width;canvas.height=bmp.height;"
+"canvas.getContext('2d').drawImage(bmp,0,0);bmp.close();"
+"}).catch(function(){});"
+"};"
+"pc.onicecandidate=function(e){"
+"if(e.candidate) fetch('/api/webrtc/ice',{method:'POST',"
+"headers:{'Content-Type':'application/json'},"
+"body:JSON.stringify({candidate:e.candidate.candidate,"
+"sdpMid:e.candidate.sdpMid,sdpMLineIndex:e.candidate.sdpMLineIndex})});"
+"};"
+"pc.onconnectionstatechange=function(){"
+"if(pc.connectionState==='failed'||pc.connectionState==='disconnected'){stopWebRTC();}"
+"};"
+"pc.createOffer().then(function(o){return pc.setLocalDescription(o);}).then(function(){"
+"return fetch('/api/webrtc/offer',{method:'POST',"
+"headers:{'Content-Type':'application/json'},"
+"body:JSON.stringify({sdp:pc.localDescription.sdp})});"
+"}).then(function(r){return r.json();}).then(function(a){"
+"if(a.sdp) return pc.setRemoteDescription(new RTCSessionDescription({type:'answer',sdp:a.sdp}));"
+"else throw new Error('No SDP in answer');"
+"}).then(function(){"
+"canvas.style.display='block';"
+"document.getElementById('cam').style.display='none';"
+"document.getElementById('cam-placeholder').style.display='none';"
+"liveActive=true;"
+"document.getElementById('btn-live').textContent='Stop Live';"
+"document.getElementById('btn-live').className='btn btn-danger';"
+"}).catch(function(e){"
+"console.log('WebRTC error:',e);stopWebRTC();"
+"});"
+"}"
+"function stopWebRTC(){"
+"liveActive=false;"
+"if(dc){dc.close();dc=null;}"
+"if(pc){pc.close();pc=null;}"
+"document.getElementById('webrtc-canvas').style.display='none';"
+"document.getElementById('cam').style.display='block';"
+"document.getElementById('btn-live').textContent='Live Stream';"
+"document.getElementById('btn-live').className='btn btn-primary';"
+"refreshCam();"
+"}"
+"function toggleLive(){"
+"if(liveActive){stopWebRTC();}else{startWebRTC();}"
+"}"
 "</script></body></html>";
 
 /* ── Bridge helpers ─────────────────────────────────────────────────── */
@@ -171,6 +235,84 @@ static void bridge_ensure_dev(void)
 static void bridge_ensure_cam(void)
 {
     if (g_cam_fd < 0) g_cam_fd = rpc_connect(CAMERA_SERVER_PORT);
+}
+
+static void bridge_ensure_webrtc(void)
+{
+    if (g_webrtc_fd >= 0) return;
+
+    g_webrtc_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (g_webrtc_fd < 0) return;
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    addr.sin_port = htons(WEBRTC_SIGNALING_PORT);
+
+    if (connect(g_webrtc_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close(g_webrtc_fd);
+        g_webrtc_fd = -1;
+        return;
+    }
+    LOG_INFO("Connected to WebRTC signalling server");
+}
+
+/*
+ * Send a line of JSON to the webrtc signalling server and read
+ * one line of JSON response.  Returns a malloc'd string (caller frees)
+ * or NULL on error.
+ */
+static char *webrtc_signaling_call(const char *json_line)
+{
+    bridge_ensure_webrtc();
+    if (g_webrtc_fd < 0) return NULL;
+
+    /* Send the line */
+    size_t len = strlen(json_line);
+    if (send(g_webrtc_fd, json_line, len, MSG_NOSIGNAL) < (ssize_t)len) {
+        LOG_ERROR("webrtc signalling send failed");
+        close(g_webrtc_fd);
+        g_webrtc_fd = -1;
+        return NULL;
+    }
+
+    /* Read response line (with 3-second timeout via select) */
+    char buf[WEBRTC_SIGNALING_BUF_SIZE];
+    int buf_pos = 0;
+
+    while (buf_pos < (int)sizeof(buf) - 1) {
+        fd_set rfds;
+        struct timeval tv = {3, 0};
+        FD_ZERO(&rfds);
+        FD_SET(g_webrtc_fd, &rfds);
+
+        int n = select(g_webrtc_fd + 1, &rfds, NULL, NULL, &tv);
+        if (n <= 0) {
+            LOG_ERROR("webrtc signalling recv timeout");
+            close(g_webrtc_fd);
+            g_webrtc_fd = -1;
+            return NULL;
+        }
+
+        ssize_t rc = recv(g_webrtc_fd, buf + buf_pos, 1, 0);
+        if (rc <= 0) {
+            close(g_webrtc_fd);
+            g_webrtc_fd = -1;
+            return NULL;
+        }
+        if (buf[buf_pos] == '\n') {
+            buf[buf_pos] = '\0';
+            if (buf_pos > 0 && buf[buf_pos - 1] == '\r')
+                buf[buf_pos - 1] = '\0';
+            return strdup(buf);
+        }
+        buf_pos++;
+    }
+    LOG_ERROR("webrtc signalling response too long");
+    close(g_webrtc_fd);
+    g_webrtc_fd = -1;
+    return NULL;
 }
 
 /* ── Route: GET / ───────────────────────────────────────────────────── */
@@ -369,6 +511,107 @@ static int route_snapshot(http_req_t *req, http_res_t *res)
     return 0;
 }
 
+/* ── Route: POST /api/webrtc/offer ──────────────────────────────────── */
+static int route_webrtc_offer(http_req_t *req, http_res_t *res)
+{
+    cJSON *j = cJSON_Parse(req->body);
+    if (!j) { http_send_error(res, 400, "Bad JSON"); return 0; }
+
+    cJSON *sdp = cJSON_GetObjectItem(j, "sdp");
+    if (!sdp || !sdp->valuestring) {
+        cJSON_Delete(j);
+        http_send_error(res, 400, "Missing sdp");
+        return 0;
+    }
+
+    /* Forward offer to webrtc_server */
+    cJSON *msg = cJSON_CreateObject();
+    cJSON_AddStringToObject(msg, "type", "offer");
+    cJSON_AddStringToObject(msg, "sdp", sdp->valuestring);
+    char *line = cJSON_PrintUnformatted(msg);
+    cJSON_Delete(msg);
+
+    /* Append newline for the signalling protocol */
+    char framed[WEBRTC_SIGNALING_BUF_SIZE];
+    snprintf(framed, sizeof(framed), "%s\n", line);
+    free(line);
+
+    char *response = webrtc_signaling_call(framed);
+    if (!response) {
+        http_send_json(res, "{\"ok\":false,\"error\":\"WebRTC server not available\"}");
+    } else {
+        /* Parse answer and send back to browser */
+        cJSON *ans = cJSON_Parse(response);
+        if (ans) {
+            cJSON *ans_sdp = cJSON_GetObjectItem(ans, "sdp");
+            cJSON *ret = cJSON_CreateObject();
+            if (ans_sdp && ans_sdp->valuestring) {
+                cJSON_AddStringToObject(ret, "sdp", ans_sdp->valuestring);
+            } else {
+                /* The answer JSON *is* the answer; check for type */
+                cJSON *t = cJSON_GetObjectItem(ans, "type");
+                if (t && t->valuestring && strcmp(t->valuestring, "answer") == 0) {
+                    cJSON_AddStringToObject(ret, "sdp",
+                        cJSON_GetObjectItem(ans, "sdp") ?
+                        cJSON_GetObjectItem(ans, "sdp")->valuestring : "");
+                } else {
+                    cJSON_AddBoolToObject(ret, "ok", false);
+                }
+            }
+            char *ret_str = cJSON_PrintUnformatted(ret);
+            http_send_json(res, ret_str);
+            free(ret_str);
+            cJSON_Delete(ret);
+            cJSON_Delete(ans);
+        } else {
+            http_send_error(res, 500, "Invalid response from WebRTC server");
+        }
+        free(response);
+    }
+
+    cJSON_Delete(j);
+    return 0;
+}
+
+/* ── Route: POST /api/webrtc/ice ─────────────────────────────────────── */
+static int route_webrtc_ice(http_req_t *req, http_res_t *res)
+{
+    cJSON *j = cJSON_Parse(req->body);
+    if (!j) { http_send_error(res, 400, "Bad JSON"); return 0; }
+
+    /* Forward ICE candidate to webrtc_server */
+    cJSON *msg = cJSON_CreateObject();
+    cJSON_AddStringToObject(msg, "type", "ice");
+
+    cJSON *candidate = cJSON_GetObjectItem(j, "candidate");
+    cJSON *sdpMid    = cJSON_GetObjectItem(j, "sdpMid");
+    cJSON *sdpMLine  = cJSON_GetObjectItem(j, "sdpMLineIndex");
+
+    if (candidate && candidate->valuestring)
+        cJSON_AddStringToObject(msg, "candidate", candidate->valuestring);
+    if (sdpMid && sdpMid->valuestring)
+        cJSON_AddStringToObject(msg, "sdpMid", sdpMid->valuestring);
+    else
+        cJSON_AddStringToObject(msg, "sdpMid", "0");
+    if (sdpMLine)
+        cJSON_AddNumberToObject(msg, "sdpMLineIndex", sdpMLine->valueint);
+
+    char *line = cJSON_PrintUnformatted(msg);
+    cJSON_Delete(msg);
+
+    char framed[WEBRTC_SIGNALING_BUF_SIZE];
+    snprintf(framed, sizeof(framed), "%s\n", line);
+    free(line);
+
+    /* Fire-and-forget: we don't block on ICE response */
+    char *response = webrtc_signaling_call(framed);
+    if (response) free(response);
+
+    http_send_json(res, "{\"ok\":true}");
+    cJSON_Delete(j);
+    return 0;
+}
+
 /* ── Main ──────────────────────────────────────────────────────────── */
 static void sig_handler(int s) { (void)s; g_running = 0; }
 
@@ -390,6 +633,8 @@ int main(void)
     http_route("POST /api/curtain", route_curtain);
     http_route("POST /api/voice", route_voice);
     http_route("GET /camera/snapshot", route_snapshot);
+    http_route("POST /api/webrtc/offer", route_webrtc_offer);
+    http_route("POST /api/webrtc/ice", route_webrtc_ice);
 
     /* Also serve index at /index.html */
     http_route("GET /index.html", route_index);
@@ -407,6 +652,7 @@ int main(void)
     http_server_stop();
     if (g_dev_fd >= 0) rpc_disconnect(g_dev_fd);
     if (g_cam_fd >= 0) rpc_disconnect(g_cam_fd);
+    if (g_webrtc_fd >= 0) close(g_webrtc_fd);
 
     LOG_INFO("Web server stopped.");
     return 0;

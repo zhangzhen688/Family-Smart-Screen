@@ -14,6 +14,8 @@
  */
 #include "camera_streamer.h"
 #include "camera_shm.h"
+#include "camera_relay.h"
+#include "webrtc_protocol.h"
 #include "v4l2_capture.h"
 #include "common.h"
 
@@ -80,6 +82,10 @@ static void *streamer_thread(void *arg)
                            + (uint64_t)ts.tv_nsec / 1000000ULL;
 
         memcpy(slot->data, frame, size);
+
+        /* Fan-out to WebRTC relay clients (non-blocking) */
+        camera_relay_broadcast((const uint8_t *)frame, (uint32_t)size);
+
         free(frame);
 
         /* Advance write cursor */
@@ -169,6 +175,10 @@ int camera_streamer_start(void)
 
     LOG_INFO("Camera streamer started (%dx%d, %d slots)",
              g_shm_hdr->width, g_shm_hdr->height, CAMERA_SHM_NUM_SLOTS);
+
+    /* Start the WebRTC frame relay */
+    camera_relay_start(WEBRTC_RELAY_PORT);
+
     return 0;
 }
 
@@ -177,6 +187,9 @@ void camera_streamer_stop(void)
     if (!g_running) return;
 
     LOG_INFO("Stopping camera streamer...");
+
+    /* Stop the WebRTC frame relay first */
+    camera_relay_stop();
 
     /* Signal the thread to exit */
     g_shm_hdr->streaming = 0;

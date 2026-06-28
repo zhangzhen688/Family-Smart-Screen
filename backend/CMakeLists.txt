@@ -17,7 +17,9 @@ add_executable(camera_server
     camera_server/rpc_server.c
     camera_server/v4l2_capture.c
     camera_server/camera_streamer.c
+    camera_server/camera_relay.c
 )
+target_include_directories(camera_server PRIVATE ${CMAKE_SOURCE_DIR}/inc)
 target_link_libraries(camera_server jsonrpc cjson pthread m rt)
 
 # ── Voice Server (port 1236 + UDP IPC to xiaozhi control_center) ──────
@@ -125,4 +127,79 @@ if(ALSA_FOUND AND OPUS_LIB AND OPUS_INCLUDE AND SPEEXDSP_LIB)
 else()
     message(STATUS "XiaoZhi sound_app: DISABLED"
             " (needs: alsa, opus, speexdsp)")
+endif()
+
+# ── WebRTC Remote Video Server ──────────────────────────────────────────
+# Dependencies: libdatachannel (headers in libs/rtc/, .so in libs/libdatachannel/)
+# + OpenSSL (already checked by XiaoZhi section above).
+#
+# On x86 simulator:   requires x86_64 libdatachannel.so in libs/libdatachannel/
+# On ARM cross-compile: requires aarch64 (or armv7) libdatachannel.so
+#
+# We avoid find_library() with cross-compilation root-path issues by
+# directly checking for the .so file and using link_directories().
+
+set(LIBDATACHANNEL_INCLUDE ${CMAKE_SOURCE_DIR}/libs)
+set(LIBDATACHANNEL_DIR     ${CMAKE_SOURCE_DIR}/libs/libdatachannel)
+
+# Check headers in libs/rtc/
+if(NOT EXISTS "${LIBDATACHANNEL_INCLUDE}/rtc/rtc.hpp")
+    set(WEBRTC_MISSING "rtc headers (expected: libs/rtc/rtc.hpp)")
+endif()
+
+# Library detection — strategy differs for native vs cross-compile:
+#   Native:   find_library validates ABI compatibility (x86 .so for x86, etc.)
+#   Cross:    find_library may miss .so outside sysroot; fall back to EXISTS
+find_library(LIBDATACHANNEL libdatachannel
+    PATHS ${LIBDATACHANNEL_DIR} /usr/lib /usr/local/lib
+    NO_DEFAULT_PATH
+)
+if(NOT LIBDATACHANNEL)
+    # Also try default system paths
+    find_library(LIBDATACHANNEL libdatachannel)
+endif()
+
+if(NOT LIBDATACHANNEL AND CMAKE_CROSSCOMPILING)
+    # Cross-compile fallback: find_library may skip paths outside sysroot.
+    # Trust the user placed the correct-architecture .so here.
+    if(EXISTS "${LIBDATACHANNEL_DIR}/libdatachannel.so")
+        set(LIBDATACHANNEL "${LIBDATACHANNEL_DIR}/libdatachannel.so")
+    elseif(EXISTS "${LIBDATACHANNEL_DIR}/libdatachannel.so.0.22")
+        set(LIBDATACHANNEL "${LIBDATACHANNEL_DIR}/libdatachannel.so.0.22")
+    endif()
+endif()
+
+if(NOT LIBDATACHANNEL AND NOT WEBRTC_MISSING)
+    set(WEBRTC_MISSING "libdatachannel.so (place correct-architecture .so in libs/libdatachannel/)")
+endif()
+if(NOT OPENSSL_FOUND AND NOT WEBRTC_MISSING)
+    set(WEBRTC_MISSING "OpenSSL dev libraries")
+endif()
+
+if(LIBDATACHANNEL AND NOT WEBRTC_MISSING AND OPENSSL_FOUND)
+    add_executable(webrtc_server
+        webrtc_server/main.cpp
+        webrtc_server/frame_source.cpp
+        webrtc_server/peer_manager.cpp
+        webrtc_server/signaling_server.cpp
+    )
+    target_include_directories(webrtc_server PRIVATE
+        ${LIBDATACHANNEL_INCLUDE}
+        ${CMAKE_SOURCE_DIR}/inc
+        ${CMAKE_CURRENT_SOURCE_DIR}/voice_server/xiaozhi
+    )
+    # Use link_directories (not find_library paths) for robustness
+    # with cross-compilation — same approach as luckfox project.
+    link_directories(${LIBDATACHANNEL_DIR})
+    target_link_libraries(webrtc_server
+        datachannel OpenSSL::SSL OpenSSL::Crypto pthread
+    )
+    message(STATUS "WebRTC server: ENABLED")
+    message(STATUS "  libdatachannel: ${LIBDATACHANNEL}")
+    message(STATUS "  headers:        ${LIBDATACHANNEL_INCLUDE}")
+else()
+    message(STATUS "WebRTC server: DISABLED")
+    if(WEBRTC_MISSING)
+        message(STATUS "  -> ${WEBRTC_MISSING}")
+    endif()
 endif()
